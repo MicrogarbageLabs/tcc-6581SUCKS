@@ -2137,6 +2137,40 @@ void parse_number(const char *p)
                 error("integer constant overflow");
         }
 
+#ifdef TCC_TARGET_816
+        /* C99 6.4.4.1 for this target's sizes: int and long are 16 bits,
+           long long 32. A constant takes the first type in its list it
+           fits: decimal int, long long; octal or hex int, unsigned int,
+           long long, unsigned long long. A 'U' takes the unsigned ones
+           only; 'L' changes nothing (long is int's size); 'LL' starts at
+           long long. Before this, anything up to $7FFFFFFF was a 16-bit
+           int: 0x410000UL lost its bank wherever its type mattered. */
+        {
+            int is_dec = (b == 10);
+            int has_u = 0, has_ll, nl = 0;
+            const char *sfx = p - 1; /* ch is always p[-1]: the suffix starts there */
+            for (;; sfx++) {
+                int c = toup(*sfx);
+                if (c == 'L')
+                    nl++;
+                else if (c == 'U')
+                    has_u = 1;
+                else
+                    break;
+            }
+            has_ll = (nl >= 2);
+            if (!has_ll && !has_u && n <= 0x7fff)
+                tok = TOK_CINT;
+            else if (!has_ll && (has_u || !is_dec) && n <= 0xffff)
+                tok = TOK_CUINT;
+            else if (!has_u && n <= 0x7fffffffULL)
+                tok = TOK_CLLONG;
+            else
+                tok = TOK_CULLONG;
+        }
+        /* the suffix loop below then changes nothing: these already allow
+           for it */
+#else
         /* XXX: not exactly ANSI compliant */
         if ((n & 0xffffffff00000000LL) != 0) {
             if ((n >> 63) != 0)
@@ -2148,6 +2182,7 @@ void parse_number(const char *p)
         } else {
             tok = TOK_CINT;
         }
+#endif
         lcount = 0;
         ucount = 0;
         for (;;) {
