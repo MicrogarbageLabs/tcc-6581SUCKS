@@ -108,13 +108,16 @@ int main(int argc, char **argv)
     // ASM Optimization
     dynArray optAsm = optimizeAsm(file, bss, f816opt_args.quietmode);
 
-    /* the stores no path reads (816-tcc fork), then the passes again on what
-       that left, until neither finds anything */
+    /* the stores no path reads and the values parked for one use (816-tcc
+       fork), then the passes again on what that left, until none finds
+       anything */
     for (;;) {
         size_t dead = deadStores(&optAsm);
+        size_t fwd = forwardOperands(&optAsm);
         if (!f816opt_args.quietmode)
-            info("%llu dead stores removed", (unsigned long long) dead);
-        if (!dead)
+            info("%llu dead stores removed, %llu operands forwarded", (unsigned long long) dead,
+                 (unsigned long long) fwd);
+        if (!dead && !fwd)
             break;
         optAsm = optimizeAsm(optAsm, bss, f816opt_args.quietmode);
     }

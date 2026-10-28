@@ -6,5 +6,8 @@
 
 /* removes stores to tcc__rN / tcc__fN that are never read; returns how many */
 size_t deadStores(dynArray *file);
+/* a value parked in a pseudo-register for one use, forwarded to it;
+   returns how many */
+size_t forwardOperands(dynArray *file);
 
 #endif

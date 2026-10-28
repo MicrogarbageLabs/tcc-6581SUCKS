@@ -15,6 +15,19 @@ each source file). **This is an altered copy**, for the 816-tcc fork:
 With those, its output matches PVSnesLib 4.5.0's binary on every file of the HX-422 build and the
 compiler tests, apart from the empty-frame code 2.0 removes, which assembled to nothing.
 
+Added (`src/deadstore.c`, public domain), run after 2.0's passes and repeated with them until
+nothing changes. Both use liveness of the pseudo-registers over the whole file's control flow, not
+a few lines of straight code:
+
+- **Dead stores:** a store to `tcc__rN` that no path reads goes.
+- **Operand forwarding:** a value parked in `tcc__rN` for one use goes straight to it:
+  `lda M / sta rN / lda … / adc rN` becomes `lda … / adc M` (also `sbc and ora eor cmp`; M
+  immediate, absolute, long or stack-relative, with no store, call, branch, width change, or stack
+  move for a stack M, in between); `sta rN / … / ldx rN` becomes `tax / …` (`ldy`: `tay`) when
+  nothing between uses the index or the flags; `stz rN / lda rN` becomes `lda.w #0`.
+
+`tests/cases/opt_forward.c` holds the cases where forwarding would be wrong.
+
 ```sh
 make            # needs PCRE2 (MSYS2: mingw-w64-x86_64-pcre2)
 816-opt -q -i file.ps -o file.asp
