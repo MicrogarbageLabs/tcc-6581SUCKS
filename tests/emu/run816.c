@@ -10,7 +10,9 @@
  *  banks; $00-$3F/$80-$BF:8000-FFFF mirror PSRAM. The CPU's multiply and
  *  divide registers ($4202-$4206 -> $4214-$4217) work and answer at once,
  *  and so does the HX-422 multiplier (A $3C30, B $3C32; A*B unsigned at
- *  $3C34, signed at $3C38, 32 bits each); every other I/O address reads 0.
+ *  $3C34, signed at $3C38, 32 bits each); $3F00 is a test register that
+ *  reads one more each time (its high byte moves it on), for volatile
+ *  tests; every other I/O address reads 0.
  *
  *  The test talks through WDM (tests/rt/test.asm). What it prints goes to
  *  stdout, then a last line: PASS, or FAIL and why. A BRK, a write to the
@@ -35,6 +37,7 @@ static uint8_t *psram, wram[0x20000];
 static uint8_t io_mula, io_mulb;
 static uint16_t io_dividend, io_quot, io_res;
 static uint16_t hx_ma, hx_mb;   /* the HX-422 multiplier's operands ($3C30, $3C32) */
+static uint16_t tick;           /* $3F00: a test register, one more each 16-bit read */
 
 static int quiet, show_cycles, trace;
 static int done, fails, checks;
@@ -68,6 +71,8 @@ static uint8_t io_read(uint16_t a)
         }
     }
     switch (a) {
+    case 0x3F00: return tick & 0xFF;
+    case 0x3F01: { uint8_t v = tick >> 8; tick++; return v; }
     case 0x4214: return io_quot & 0xFF;
     case 0x4215: return io_quot >> 8;
     case 0x4216: return io_res & 0xFF;

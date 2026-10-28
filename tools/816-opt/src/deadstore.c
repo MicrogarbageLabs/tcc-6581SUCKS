@@ -58,6 +58,7 @@ typedef struct {
     regset exitset;
     int store;              /* a whole store, deletable when dead */
     int keep;
+    int vol;                /* "; volatile": an access 816-tcc marked, never dropped, moved or reused */
 } line_t;
 
 typedef struct {
@@ -227,6 +228,7 @@ static void analyze(dynArray *file, flow_t *F)
         int lab, k;
 
         l->keep = strstr(file->arr[i], "DON'T OPTIMIZE") != NULL;
+        l->vol = strstr(file->arr[i], "; volatile") != NULL;
         l->nsucc = 1;
         l->succ[0] = (int) i + 1;
         l->op = "";
@@ -644,7 +646,7 @@ size_t forwardOperands(dynArray *file)
         }
 
         /* lda M / sta rN / (A reloaded) ... / OP rN  ->  ... / OP M */
-        if (is(a, "lda") && plain_operand(a) && !a->m8 && i + 2 < F.n) {
+        if (is(a, "lda") && plain_operand(a) && !a->m8 && !a->vol && i + 2 < F.n) {
             line_t *s = &F.L[i + 1];
             int rs = stored_reg(s);
             if (rs >= 0 && is(s, "sta") && !s->keep && !gone[i + 1] && sets_a_fresh(&F.L[i + 2]) && !F.L[i + 2].labelled) {
@@ -719,6 +721,609 @@ size_t forwardOperands(dynArray *file)
                 }
                 if (t->use & ((regset) 1 << r) || t->def & ((regset) 1 << r))
                     break;
+            }
+        }
+    }
+
+    free(gone);
+    release(&F);
+    compact(file);
+    return done;
+}
+
+/* ============================================================
+   knownRegs: what A, X and Y hold, as "the value of operand M", by forward
+   dataflow; a load of what a register already holds goes.
+   ============================================================ */
+
+#define K_TOP (-2)              /* not reached yet */
+#define K_UNK (-1)
+
+typedef struct {
+    int a, x, y;
+} regs_t;
+
+typedef struct {
+    char **keys;
+    int n, cap;
+} keytab_t;
+
+static int key_of(keytab_t *T, const char *s)
+{
+    int i;
+    for (i = 0; i < T->n; i++)
+        if (!strcmp(T->keys[i], s))
+            return i;
+    if (T->n == T->cap) {
+        T->cap = T->cap ? T->cap * 2 : 64;
+        T->keys = realloc(T->keys, T->cap * sizeof *T->keys);
+        if (!T->keys)
+            fatal("malloc-deadstore");
+    }
+    T->keys[T->n] = malloc(strlen(s) + 1);
+    if (!T->keys[T->n])
+        fatal("malloc-deadstore");
+    strcpy(T->keys[T->n], s);
+    return T->n++;
+}
+
+/* an operand whose value a register can be said to hold: immediate,
+   direct page, absolute, long or stack-relative; no index, no indirection */
+static int trackable(const line_t *l)
+{
+    const char *o = l->op;
+    if (!*o || strchr(o, '[') || strchr(o, '('))
+        return 0;
+    if (strstr(o, ",x") || strstr(o, ",X") || strstr(o, ",y") || strstr(o, ",Y"))
+        return 0;
+    return 1;
+}
+
+static int key_is_memory(keytab_t *T, int k) { return k >= 0 && !strchr(T->keys[k], '#'); }
+static int key_is_stack(keytab_t *T, int k) { return k >= 0 && (strstr(T->keys[k], ",s") || strstr(T->keys[k], ",S")); }
+
+static void forget_memory(keytab_t *T, regs_t *r)
+{
+    if (key_is_memory(T, r->a))
+        r->a = K_UNK;
+    if (key_is_memory(T, r->x))
+        r->x = K_UNK;
+    if (key_is_memory(T, r->y))
+        r->y = K_UNK;
+}
+
+static void forget_stack(keytab_t *T, regs_t *r)
+{
+    if (key_is_stack(T, r->a))
+        r->a = K_UNK;
+    if (key_is_stack(T, r->x))
+        r->x = K_UNK;
+    if (key_is_stack(T, r->y))
+        r->y = K_UNK;
+}
+
+static int meet1(int a, int b)
+{
+    if (a == K_TOP)
+        return b;
+    if (b == K_TOP)
+        return a;
+    return a == b ? a : K_UNK;
+}
+
+static int is_cond_branch(const line_t *l)
+{
+    return l->kind == K_INSN && l->mn[0] == 'b' && !is(l, "bra") && !is(l, "brl") && !is(l, "bit");
+}
+
+/* the registers after line l, from those before */
+static void transfer(keytab_t *T, const line_t *l, regs_t *r)
+{
+    static const char *nochange[] = {"clc", "sec", "cld", "sed", "cli", "sei", "clv", "nop", "cmp", "cpx", "cpy",
+                                     "bit", "bra", "brl", "jmp", "jml", "wdm", NULL};
+    static const char *stackops[] = {"pha", "phx", "phy", "php", "phb", "phd", "phk", "pea", "pei", "per", "plp",
+                                     "plb", "pld", NULL};
+    int k;
+    if (l->kind == K_DIRECTIVE) {
+        r->a = r->x = r->y = K_UNK;     /* conditional assembly: maybe not there */
+        return;
+    }
+    if (l->kind != K_INSN)
+        return;
+    if (is(l, "lda") || is(l, "ldx") || is(l, "ldy")) {
+        int v = (trackable(l) && !l->vol) ? key_of(T, l->rest) : K_UNK;
+        if (is(l, "lda"))
+            r->a = v;
+        else if (is(l, "ldx"))
+            r->x = v;
+        else
+            r->y = v;
+        return;
+    }
+    if (is(l, "sta") || is(l, "stx") || is(l, "sty") || is(l, "stz")) {
+        forget_memory(T, r);
+        if (trackable(l) && !strchr(l->op, '#') && !l->vol) {
+            int v = key_of(T, l->rest);
+            if (is(l, "sta"))
+                r->a = v;
+            else if (is(l, "stx"))
+                r->x = v;
+            else if (is(l, "sty"))
+                r->y = v;
+        }
+        return;
+    }
+    if (is(l, "tax")) { r->x = r->a; return; }
+    if (is(l, "tay")) { r->y = r->a; return; }
+    if (is(l, "txa")) { r->a = r->x; return; }
+    if (is(l, "tya")) { r->a = r->y; return; }
+    if (is(l, "txy")) { r->y = r->x; return; }
+    if (is(l, "tyx")) { r->x = r->y; return; }
+    if (is(l, "inx") || is(l, "dex") || is(l, "tsx") || is(l, "plx")) { r->x = K_UNK; forget_stack(T, r); return; }
+    if (is(l, "iny") || is(l, "dey") || is(l, "ply")) { r->y = K_UNK; forget_stack(T, r); return; }
+    if (is(l, "pla")) { r->a = K_UNK; forget_stack(T, r); return; }
+    for (k = 0; stackops[k]; k++)
+        if (is(l, stackops[k])) {
+            forget_stack(T, r);
+            return;
+        }
+    if (is(l, "tcs") || is(l, "tas") || is(l, "txs")) { forget_stack(T, r); return; }
+    for (k = 0; nochange[k]; k++)
+        if (is(l, nochange[k]))
+            return;
+    if (is_cond_branch(l))
+        return;
+    /* read-modify-write on memory */
+    if ((is(l, "inc") || is(l, "dec") || is(l, "asl") || is(l, "lsr") || is(l, "rol") || is(l, "ror")) && l->op[0]
+        && strcmp(l->op, "a")) {
+        forget_memory(T, r);
+        return;
+    }
+    if (is(l, "tsb") || is(l, "trb")) {
+        forget_memory(T, r);
+        return;
+    }
+    /* A changed: arithmetic, shifts and the like on A */
+    if (is(l, "adc") || is(l, "sbc") || is(l, "and") || is(l, "ora") || is(l, "eor") || is(l, "xba") || is(l, "inc")
+        || is(l, "dec") || is(l, "asl") || is(l, "lsr") || is(l, "rol") || is(l, "ror") || is(l, "tdc")
+        || is(l, "tsc") || is(l, "tsa")) {
+        r->a = K_UNK;
+        return;
+    }
+    /* calls, tcd, sep/rep, block moves, anything else: nothing known */
+    r->a = r->x = r->y = K_UNK;
+}
+
+/* N and Z as a load left them are read before anything sets them again */
+static int nz_needed_after(flow_t *F, size_t i)
+{
+    size_t j;
+    static const char *writers[] = {"lda", "ldx", "ldy", "adc", "sbc", "and", "ora", "eor", "cmp", "cpx", "cpy", "bit",
+                                    "inc", "dec", "inx", "dex", "iny", "dey", "asl", "lsr", "rol", "ror", "tax",
+                                    "tay", "txa", "tya", "tsx", "txy", "tyx", "pla", "plx", "ply", "plp", "tdc",
+                                    "tsc", "tsa", "xba", NULL};
+    for (j = i + 1; j < F->n && j < i + 32; j++) {
+        line_t *l = &F->L[j];
+        int k;
+        if (l->kind == K_NONE)
+            continue;
+        if (l->kind != K_INSN || l->labelled)
+            return 1;           /* a label or directive: someone may test them */
+        if (is_cond_branch(l) || is(l, "php"))
+            return 1;
+        for (k = 0; writers[k]; k++)
+            if (is(l, writers[k]))
+                return 0;
+        if (is(l, "rtl") || is(l, "rts") || is(l, "jsr") || is(l, "jsl"))
+            return 0;           /* nobody reads flags across a call or a return */
+        if (l->flow)
+            return 1;
+    }
+    return 1;
+}
+
+size_t knownRegs(dynArray *file)
+{
+    flow_t F;
+    keytab_t T = {0};
+    regs_t *in, *out;
+    int **preds, *npred, changed;
+    size_t i, done = 0;
+
+    if (!file->used)
+        return 0;
+    analyze(file, &F);
+    in = malloc(F.n * sizeof *in);
+    out = malloc(F.n * sizeof *out);
+    preds = calloc(F.n, sizeof *preds);
+    npred = calloc(F.n, sizeof *npred);
+    if (!in || !out || !preds || !npred)
+        fatal("malloc-deadstore");
+
+    /* predecessors */
+    for (i = 0; i < F.n; i++) {
+        int s;
+        for (s = 0; s < F.L[i].nsucc; s++) {
+            int t = F.L[i].succ[s];
+            if (t >= 0 && t < (int) F.n)
+                npred[t]++;
+        }
+    }
+    for (i = 0; i < F.n; i++) {
+        preds[i] = malloc((npred[i] ? npred[i] : 1) * sizeof **preds);
+        if (!preds[i])
+            fatal("malloc-deadstore");
+        npred[i] = 0;
+    }
+    for (i = 0; i < F.n; i++) {
+        int s;
+        for (s = 0; s < F.L[i].nsucc; s++) {
+            int t = F.L[i].succ[s];
+            if (t >= 0 && t < (int) F.n)
+                preds[t][npred[t]++] = (int) i;
+        }
+    }
+
+    for (i = 0; i < F.n; i++)
+        in[i].a = in[i].x = in[i].y = out[i].a = out[i].x = out[i].y = K_TOP;
+    do {
+        changed = 0;
+        for (i = 0; i < F.n; i++) {
+            regs_t r;
+            int p, ours;
+            /* a named label is an entry from anywhere (a function), unless
+               it's one of the compiler's own: __local_ and __c labels are
+               reached only by the jumps in this file, which agree or not */
+            ours = F.L[i].kind == K_LABEL && !F.L[i].labelled
+                   && (!strncmp(F.code[i], "__local_", 8) || !strncmp(F.code[i], "__c", 3));
+            if (npred[i] == 0 || (F.L[i].kind == K_LABEL && !ours))
+                r.a = r.x = r.y = K_UNK;
+            else {
+                r.a = r.x = r.y = K_TOP;
+                for (p = 0; p < npred[i]; p++) {
+                    regs_t *q = &out[preds[i][p]];
+                    r.a = meet1(r.a, q->a);
+                    r.x = meet1(r.x, q->x);
+                    r.y = meet1(r.y, q->y);
+                }
+            }
+            if (r.a != in[i].a || r.x != in[i].x || r.y != in[i].y) {
+                in[i] = r;
+                changed = 1;
+            }
+            transfer(&T, &F.L[i], &r);
+            if (r.a != out[i].a || r.x != out[i].x || r.y != out[i].y) {
+                out[i] = r;
+                changed = 1;
+            }
+        }
+    } while (changed);
+
+    for (i = 0; i < F.n; i++) {
+        line_t *l = &F.L[i];
+        int have;
+        if (l->kind != K_INSN || l->keep || l->labelled || l->vol || !trackable(l))
+            continue;
+        if (is(l, "lda"))
+            have = in[i].a;
+        else if (is(l, "ldx"))
+            have = in[i].x;
+        else if (is(l, "ldy"))
+            have = in[i].y;
+        else
+            continue;
+        if (have >= 0 && !strcmp(T.keys[have], l->rest) && !nz_needed_after(&F, i)) {
+            drop_line(file, i);
+            done++;
+        }
+    }
+
+    for (i = 0; i < F.n; i++)
+        free(preds[i]);
+    free(preds);
+    free(npred);
+    free(in);
+    free(out);
+    for (i = 0; i < (size_t) T.n; i++)
+        free(T.keys[i]);
+    free(T.keys);
+    release(&F);
+    compact(file);
+    return done;
+}
+
+/* ============================================================
+   reuseBlocks: a computation done again, from the same sources, into
+   another pseudo-register goes; its uses read the first one's register.
+
+     lda.b l0 / sta.b r0 / asl a / asl a / clc / adc.b r0 / asl a / sta.b r0
+     lda.b l0 / sta.b r1 / asl a / asl a / clc / adc.b r1 / asl a / sta.b r1
+     ldx.b r0 ... ldx.b r1 ...        ->  the second block goes, ldx.b r0
+
+   A block: from an lda through the last "sta.b tcc__rK" before A is next
+   loaded; inside, only A's own operations, reads of memory and the
+   register's own stores (rK). Conditions: the blocks match line for line
+   with rA for rB; between them nothing stores to memory the first reads,
+   to rA, moves the stack (for a stack operand), branches, or has a label;
+   after the second, A and the flags it left are not needed, rB is dead
+   before any branch or label, and rA is not written while rB's uses are
+   renamed.
+   ============================================================ */
+
+/* the line with every "tcc__<from>" (whole token) as "tcc__<to>" */
+static void rename_reg(const char *s, int from, int to, char *out, size_t n)
+{
+    char fname[16], tname[16];
+    size_t fl, o = 0;
+    snprintf(fname, sizeof fname, "tcc__r%d", from / 2);
+    snprintf(tname, sizeof tname, "tcc__r%d", to / 2);
+    fl = strlen(fname);
+    while (*s && o + 16 < n) {
+        if (!strncmp(s, fname, fl)) {
+            char c = s[fl];
+            if (!((c >= '0' && c <= '9') || c == 'h' || (c >= 'a' && c <= 'z') || c == '_')) {
+                size_t k;
+                for (k = 0; tname[k]; k++)
+                    out[o++] = tname[k];
+                s += fl;
+                continue;
+            }
+        }
+        out[o++] = *s++;
+    }
+    out[o] = 0;
+}
+
+static int mentions_reg(const char *s, int bit)
+{
+    return (regs_in(s) >> bit) & 1;
+}
+
+/* A's own operations, a block may contain */
+static int a_only(const line_t *l)
+{
+    static const char *ok[] = {"asl", "lsr", "rol", "ror", "inc", "dec", "adc", "sbc", "and", "ora", "eor", "clc",
+                               "sec", "xba", "cmp", NULL};
+    int k;
+    for (k = 0; ok[k]; k++)
+        if (is(l, ok[k])) {
+            /* shifts and inc/dec on A only, not on memory */
+            if ((is(l, "asl") || is(l, "lsr") || is(l, "rol") || is(l, "ror") || is(l, "inc") || is(l, "dec"))
+                && l->op[0] && strcmp(l->op, "a"))
+                return 0;
+            return 1;
+        }
+    return 0;
+}
+
+/* the block starting at s (an lda): its end, and the register it makes,
+   or -1 */
+static int block_at(flow_t *F, size_t s, size_t *end, int *reg)
+{
+    size_t j, last = 0;
+    int r = -1;
+    line_t *l = &F->L[s];
+    if (!is(l, "lda") || l->keep || l->labelled || l->m8 || l->vol || !plain_operand(l))
+        return -1;
+    for (j = s + 1; j < F->n && j < s + 24; j++) {
+        line_t *t = &F->L[j];
+        int b;
+        if (t->kind != K_INSN || t->labelled || t->keep || t->flow || t->m8 || t->vol)
+            break;
+        b = stored_reg(t);
+        if (b >= 0 && b < 32 && is(t, "sta") && !(b & 1)) {
+            if (r < 0)
+                r = b;
+            if (b != r)
+                break;
+            last = j;
+            continue;
+        }
+        if (a_only(t) && !strchr(t->op, ',') && !strchr(t->op, '[') && !strchr(t->op, '('))
+            continue;
+        break;
+    }
+    if (r < 0 || !last)
+        return -1;
+    *end = last;
+    *reg = r;
+    return 0;
+}
+
+/* flags as the dropped block left them are needed after line e: a test,
+   or a carry use, before anything sets them */
+static int flags_needed_after(flow_t *F, size_t e)
+{
+    size_t j;
+    for (j = e + 1; j < F->n && j < e + 32; j++) {
+        line_t *l = &F->L[j];
+        if (l->kind == K_NONE)
+            continue;
+        if (l->kind != K_INSN || l->labelled)
+            return 1;
+        if (is_cond_branch(l) || is(l, "php"))
+            return 1;
+        if (is(l, "adc") || is(l, "sbc") || is(l, "rol") || is(l, "ror"))
+            return 1;           /* the carry */
+        if (is(l, "cmp") || is(l, "cpx") || is(l, "cpy"))
+            return 0;           /* N, Z and C anew */
+        if (is(l, "clc") || is(l, "sec")) {
+            /* C anew; N and Z are still the block's until a writer */
+            size_t k;
+            for (k = j + 1; k < F->n && k < j + 32; k++) {
+                line_t *m = &F->L[k];
+                if (m->kind == K_NONE)
+                    continue;
+                if (m->kind != K_INSN || m->labelled || is_cond_branch(m) || is(m, "php"))
+                    return 1;
+                if (is(m, "lda") || is(m, "adc") || is(m, "sbc") || is(m, "and") || is(m, "ora") || is(m, "eor")
+                    || is(m, "ldx") || is(m, "ldy") || is(m, "cmp"))
+                    return 0;
+                if (m->flow)
+                    return 1;
+            }
+            return 1;
+        }
+        if (is(l, "lda") || is(l, "ldx") || is(l, "ldy") || is(l, "and") || is(l, "ora") || is(l, "eor")) {
+            /* N and Z anew, C still the block's: a later carry use reads it */
+            size_t k;
+            for (k = j + 1; k < F->n && k < j + 32; k++) {
+                line_t *m = &F->L[k];
+                if (m->kind == K_NONE)
+                    continue;
+                if (m->kind != K_INSN || m->labelled)
+                    return 1;
+                if (is(m, "adc") || is(m, "sbc") || is(m, "rol") || is(m, "ror") || is_cond_branch(m) || is(m, "php"))
+                    return 1;
+                if (is(m, "clc") || is(m, "sec") || is(m, "cmp") || is(m, "cpx") || is(m, "cpy"))
+                    return 0;
+                if (is(m, "rtl") || is(m, "rts") || is(m, "jsr") || is(m, "jsl"))
+                    return 0;
+                if (m->flow)
+                    return 1;
+            }
+            return 1;
+        }
+        if (is(l, "rtl") || is(l, "rts") || is(l, "jsr") || is(l, "jsl"))
+            return 0;
+        if (l->flow)
+            return 1;
+    }
+    return 1;
+}
+
+/* A's value is not read after line e before it's loaded anew */
+static int a_unread_after(flow_t *F, size_t e)
+{
+    static const char *noa[] = {"ldx", "ldy", "stx", "sty", "stz", "inx", "dex", "iny", "dey", "cpx", "cpy", "txy",
+                                "tyx", "pea", "pei", "phx", "phy", "plx", "ply", "clc", "sec", "nop", NULL};
+    size_t j;
+    for (j = e + 1; j < F->n && j < e + 32; j++) {
+        line_t *l = &F->L[j];
+        int k, quiet = 0;
+        if (l->kind == K_NONE)
+            continue;
+        if (l->kind != K_INSN || l->labelled)
+            return 0;
+        if (a_overwritten(l))
+            return 1;
+        if (is(l, "rtl") || is(l, "rts"))
+            return 1;
+        for (k = 0; noa[k]; k++)
+            if (is(l, noa[k]))
+                quiet = 1;
+        if (!quiet)
+            return 0;
+    }
+    return 0;
+}
+
+size_t reuseBlocks(dynArray *file)
+{
+    flow_t F;
+    size_t i, done = 0;
+    char *gone;
+    char buf[MAXLEN_LINE], buf2[MAXLEN_LINE];
+
+    if (!file->used)
+        return 0;
+    analyze(file, &F);
+    gone = calloc(F.n, 1);
+    if (!gone)
+        fatal("malloc-deadstore");
+
+    for (i = 0; i < F.n; i++) {
+        size_t e1, s2, e2, len, k, j;
+        int ra, rb, ok, sr;
+        if (gone[i] || block_at(&F, i, &e1, &ra) < 0)
+            continue;
+        len = e1 - i + 1;
+        sr = 0;
+        for (k = i; k <= e1; k++)
+            if (stack_relative(&F.L[k]))
+                sr = 1;
+        /* the next block that could repeat it, in the same straight code */
+        for (s2 = e1 + 1; s2 < F.n && s2 < e1 + 40; s2++) {
+            line_t *t = &F.L[s2];
+            if (gone[s2] || t->kind != K_INSN || t->labelled || t->flow || t->keep)
+                break;
+            if (block_at(&F, s2, &e2, &rb) == 0 && e2 - s2 + 1 == len && rb != ra) {
+                /* line for line, rA as rB, and neither names the other */
+                ok = 1;
+                for (k = 0; k < len && ok; k++) {
+                    if (mentions_reg(F.code[s2 + k], ra) || mentions_reg(F.code[i + k], rb))
+                        ok = 0;
+                    rename_reg(F.code[i + k], ra, rb, buf, sizeof buf);
+                    if (strcmp(buf, F.code[s2 + k]))
+                        ok = 0;
+                }
+                if (!ok)
+                    break;
+                /* between: nothing the first block reads, or rA, changes */
+                for (j = e1 + 1; j < s2 && ok; j++) {
+                    line_t *m = &F.L[j];
+                    int b = stored_reg(m);
+                    if (b >= 0) {
+                        /* a pseudo-register store: not rA, nor one the block reads */
+                        for (k = i; k <= e1; k++)
+                            if (mentions_reg(F.code[k], b) && b != ra)
+                                ok = 0;
+                        if (b == ra || b == ra + 1)
+                            ok = 0;
+                    } else if (writes_memory(m))
+                        ok = 0;
+                    if (sr && stack_op(m))
+                        ok = 0;
+                    if (is(m, "sep") || is(m, "rep") || m->flow || m->labelled || m->kind != K_INSN)
+                        ok = 0;
+                }
+                /* after: A and the flags the second block left aren't needed */
+                if (ok && (!a_unread_after(&F, e2) || flags_needed_after(&F, e2)))
+                    ok = 0;
+                /* rB's uses, until it's dead, can read rA (unchanged) */
+                if (ok) {
+                    size_t last = 0;
+                    for (j = e2 + 1; j < F.n; j++) {
+                        line_t *m = &F.L[j];
+                        if (gone[j])
+                            break;
+                        if (m->kind != K_INSN || m->labelled) {
+                            ok = 0;     /* still live at a label or directive */
+                            break;
+                        }
+                        if (stored_reg(m) == ra || ((m->def >> ra) & 1) || stored_reg(m) == rb) {
+                            ok = 0;
+                            break;
+                        }
+                        if (m->flow && ((F.out[j] >> rb) & 1)) {
+                            ok = 0;
+                            break;
+                        }
+                        if (mentions_reg(F.code[j], rb + 1)) {
+                            ok = 0;     /* rBh: not ours to rename */
+                            break;
+                        }
+                        if (!((F.out[j] >> rb) & 1)) {
+                            last = j;
+                            break;
+                        }
+                    }
+                    if (ok && last) {
+                        for (j = e2 + 1; j <= last; j++)
+                            if (mentions_reg(F.code[j], rb)) {
+                                rename_reg(file->arr[j], rb, ra, buf2, sizeof buf2);
+                                replace_line(file, j, buf2);
+                            }
+                        for (j = s2; j <= e2; j++) {
+                            drop_line(file, j);
+                            gone[j] = 1;
+                        }
+                        for (j = i; j <= e1; j++)
+                            gone[j] = 1;
+                        done++;
+                    }
+                }
+                break;
             }
         }
     }

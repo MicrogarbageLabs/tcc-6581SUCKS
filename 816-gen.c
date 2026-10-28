@@ -249,12 +249,43 @@ char line[MAXLEN];
  *               by the values specified in subsequent additional arguments and formatted as requested.
  * @param ... This indicates that the function takes a variable number of additional arguments.
  */
+/* while set, every instruction line pr writes ends "; volatile": the
+   access is to a volatile object, and 816-opt must not drop, move or reuse
+   it (load and store set it) */
+static int pr_volatile = 0;
+
 void pr(const char *format, ...)
 {
     va_list args;
     va_start(args, format);
     vsnprintf(line, sizeof(line), format, args);
     va_end(args);
+    if (pr_volatile) {
+        char out[MAXLEN * 4];
+        const char *p = line;
+        size_t o = 0;
+        while (*p && o + 32 < sizeof out) {
+            const char *e = strchr(p, '\n');
+            size_t n = e ? (size_t) (e - p) : strlen(p);
+            int insn = (*p >= 'a' && *p <= 'z') && !(n && p[n - 1] == ':');
+            if (o + n + 16 >= sizeof out)
+                break;
+            memcpy(out + o, p, n);
+            o += n;
+            if (insn && !memchr(p, ';', n)) {
+                memcpy(out + o, " ; volatile", 11);
+                o += 11;
+            }
+            if (e) {
+                out[o++] = '\n';
+                p = e + 1;
+            } else
+                p += n;
+        }
+        out[o] = 0;
+        s(out);
+        return;
+    }
     s(line);
 }
 
@@ -642,7 +673,19 @@ int ll_workaround = 0;
  * value being loaded into a register. This includes the register to load into (`sv->r`), the type of
  * the value (`sv->type.t`), and any additional information about the value.
  */
+static void load_impl(int r, SValue *sv);
+
+/* a load, marked for 816-opt when the object is volatile */
 void load(int r, SValue *sv)
+{
+    int saved = pr_volatile;
+    if (sv->type.t & VT_VOLATILE)
+        pr_volatile = 1;
+    load_impl(r, sv);
+    pr_volatile = saved;
+}
+
+static void load_impl(int r, SValue *sv)
 {
     int fr, ft, fc;
     int length;
@@ -1011,7 +1054,19 @@ void load(int r, SValue *sv)
  * @param sv   Pointer to a structure of type SValue which holds the value and its
  *             location to be stored.
  */
+static void store_impl(int r, SValue *sv);
+
+/* a store, marked for 816-opt when the object is volatile */
 void store(int r, SValue *sv)
+{
+    int saved = pr_volatile;
+    if (sv->type.t & VT_VOLATILE)
+        pr_volatile = 1;
+    store_impl(r, sv);
+    pr_volatile = saved;
+}
+
+static void store_impl(int r, SValue *sv)
 {
     int v, ft, fc, fr, sign;
     int base;

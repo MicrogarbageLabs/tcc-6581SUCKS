@@ -114,10 +114,15 @@ int main(int argc, char **argv)
     for (;;) {
         size_t dead = deadStores(&optAsm);
         size_t fwd = forwardOperands(&optAsm);
+        /* repeated blocks before known loads: dropping a block's first
+           load would hide the block */
+        size_t reuse = reuseBlocks(&optAsm);
+        size_t known = knownRegs(&optAsm);
         if (!f816opt_args.quietmode)
-            info("%llu dead stores removed, %llu operands forwarded", (unsigned long long) dead,
-                 (unsigned long long) fwd);
-        if (!dead && !fwd)
+            info("%llu dead stores removed, %llu operands forwarded, %llu loads of known values, %llu blocks reused",
+                 (unsigned long long) dead, (unsigned long long) fwd, (unsigned long long) known,
+                 (unsigned long long) reuse);
+        if (!dead && !fwd && !known && !reuse)
             break;
         optAsm = optimizeAsm(optAsm, bss, f816opt_args.quietmode);
     }

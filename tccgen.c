@@ -2117,7 +2117,18 @@ static void gen_cast(CType *type)
            we must update the VT_LVAL_xxx size */
         vtop->r = (vtop->r & ~VT_LVAL_TYPE) | (lvalue_type(type->ref->type.t) & VT_LVAL_TYPE);
     }
+#ifdef TCC_TARGET_816
+    {
+        /* a volatile object not loaded yet stays volatile through the cast,
+           so its load is marked for 816-opt (load reads the type) */
+        int vol = (vtop->type.t & VT_VOLATILE) && (vtop->r & VT_LVAL);
+        vtop->type = *type;
+        if (vol)
+            vtop->type.t |= VT_VOLATILE;
+    }
+#else
     vtop->type = *type;
+#endif
 }
 
 /* return type size. Put alignment at 'a' */

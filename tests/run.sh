@@ -82,5 +82,20 @@ for n in $cases; do
         fail=$((fail + 1))
     fi
 done
+# 816-opt on hand-written input: a volatile read is never dropped (and the
+# same read unmarked is, so the check can fail)
+if "$OPT" -h 2>&1 | grep -q -- '--file-input'; then
+    run_opt opt/vol_marked.ps $B/vol_marked.asp > /dev/null 2>&1
+    run_opt opt/vol_unmarked.ps $B/vol_unmarked.asp > /dev/null 2>&1
+    m=$(grep -c '^lda.l 16128' $B/vol_marked.asp)
+    u=$(grep -c '^lda.l 16128' $B/vol_unmarked.asp)
+    if [ "$m" = 2 ] && [ "$u" = 1 ]; then
+        echo "opt volatile: PASS (marked reads kept $m, unmarked $u)"
+        pass=$((pass + 1))
+    else
+        echo "opt volatile: FAIL (marked reads kept $m of 2, unmarked $u, want 1)"
+        fail=$((fail + 1))
+    fi
+fi
 echo "$pass passed, $fail failed"
 [ $fail = 0 ]
