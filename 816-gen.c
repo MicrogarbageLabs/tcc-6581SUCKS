@@ -387,6 +387,54 @@ int args_size = 0;
 
 static int jcc_begin(int cond);
 
+/* An indexed global: a register value whose r has VT_IDXSYM is
+   sym + c.i + (that register, a 16-bit byte offset). With VT_LVAL it is
+   the element there: ldx.b tcc__rN / lda.l sym+c,x. Without, the address,
+   made into a pointer only when something needs one. The flag borrows
+   VT_BOUNDED (bounds checking, which this target doesn't use). The long
+   indexed address carries into the next bank, where the old pointer add
+   wrapped in it: the same for any index inside a C array. */
+#define VT_IDXSYM VT_BOUNDED
+
+static int is_idx(SValue *v)
+{
+    return (v->r & VT_IDXSYM) && (v->r & VT_VALMASK) < VT_CONST;
+}
+
+static int is_idx_addr(SValue *v)
+{
+    return is_idx(v) && !(v->r & VT_LVAL);
+}
+
+static int is_plain_const(SValue *v)
+{
+    int bt = v->type.t & VT_BTYPE;
+    return (v->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && bt != VT_LLONG && !is_float(v->type.t);
+}
+
+static int is_sym_addr(SValue *v)
+{
+    return (v->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM) && (v->type.t & VT_BTYPE) == VT_PTR;
+}
+
+static int is_int_val(SValue *v)
+{
+    int bt = v->type.t & VT_BTYPE;
+    if (is_idx(v) || (v->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+        return 0;
+    return bt == VT_INT || bt == VT_SHORT || bt == VT_BYTE || bt == VT_BOOL;
+}
+
+/* an indexed global's address into register r as a pointer (the bank
+   from the symbol, as for any symbol's address) */
+static void idx_to_ptr(int r, SValue *sv)
+{
+    char *sy = get_sym_str(sv->sym);
+    pr("; idx addr [%s + %d + tcc__r%d] -> tcc__r%d\n", sy, sv->c.i, sv->r & VT_VALMASK, r);
+    pr("lda.w #%s + %d\nclc\nadc.b tcc__r%d\nsta.b tcc__r%d\nlda.w #:%s\nsta.b tcc__r%dh\n",
+       sy, sv->c.i, sv->r & VT_VALMASK, r, sy, r);
+}
+
 int ll_workaround = 0;
 
 /**
@@ -418,6 +466,40 @@ void load(int r, SValue *sv)
 
     int base = -1;
     v = fr & VT_VALMASK;
+    if (is_idx(sv)) {
+        char *sy = get_sym_str(sv->sym);
+        if (!(fr & VT_LVAL)) {      /* the address */
+            idx_to_ptr(r, sv);
+            return;
+        }
+        /* the element: as a symbol's, indexed by X */
+        pr("; ld%d [%s + %d + tcc__r%d], r%d\n", length, sy, fc, v, r);
+        pr("ldx.b tcc__r%d\n", v);
+        if (is_float(ft)) {
+            if (length != 4)
+                error("ICE idx float");
+            pr("lda.l %s + %d,x\nsta.b tcc__f%d\nlda.l %s + %d + 2,x\nsta.b tcc__f%dh\n",
+               sy, fc, r - TREG_F0, sy, fc, r - TREG_F0);
+            return;
+        }
+        switch (length) {
+        case 1:
+            pr("lda.w #0\nsep #$20\nlda.l %s + %d,x\nrep #$20\n", sy, fc);
+            if (!(ft & VT_UNSIGNED))
+                pr("xba\nxba\nbpl +\nora.w #$ff00\n+\n");
+            pr("sta.b tcc__r%d\n", r);
+            break;
+        case 2:
+            pr("lda.l %s + %d,x\nsta.b tcc__r%d\n", sy, fc, r);
+            break;
+        case 4:
+            pr("lda.l %s + %d,x\nsta.b tcc__r%d\nlda.l %s + %d + 2,x\nsta.b tcc__r%dh\n", sy, fc, r, sy, fc, r);
+            break;
+        default:
+            error("ICE idx load %d", length);
+        }
+        return;
+    }
     if (fr & VT_LVAL) {
         if (v == VT_LLOCAL) {
             v1.type.t = VT_PTR;
@@ -719,6 +801,29 @@ void store(int r, SValue *sv)
         length = 2; // long longs are handled word-wise
 
     pr("; store r 0x%x fr 0x%x ft 0x%x fc 0x%x\n", r, fr, ft, fc);
+
+    if (is_idx(sv) && (fr & VT_LVAL)) {     /* an indexed global's element */
+        char *sy = get_sym_str(sv->sym);
+        pr("ldx.b tcc__r%d\n", fr & VT_VALMASK);
+        switch (length) {
+        case 1:
+            pr("sep #$20\nlda.b tcc__r%d\nsta.l %s + %d,x\nrep #$20\n", r, sy, fc);
+            break;
+        case 2:
+            pr("lda.b tcc__r%d\nsta.l %s + %d,x\n", r, sy, fc);
+            break;
+        case 4:
+            if (r >= TREG_F0)
+                pr("lda.b tcc__f%d\nsta.l %s + %d,x\nlda.b tcc__f%dh\nsta.l %s + %d + 2,x\n",
+                   r - TREG_F0, sy, fc, r - TREG_F0, sy, fc);
+            else
+                pr("lda.b tcc__r%d\nsta.l %s + %d,x\nlda.b tcc__r%dh\nsta.l %s + %d + 2,x\n", r, sy, fc, r, sy, fc);
+            break;
+        default:
+            error("ICE idx store %d", length);
+        }
+        return;
+    }
 
     v = fr & VT_VALMASK;
     base = -1;
@@ -1277,6 +1382,46 @@ void gen_opi(int op)
     int isconst = 0;
     int timesshift, i;
     int skipcall;
+
+    /* indexed globals: symbol + int register becomes a VT_IDXSYM value
+       (the register holds the offset), and a constant added to one goes
+       into its displacement, so arr[i] is ldx + lda.l arr,x and a struct
+       field adds nothing at run time */
+    if (op == '+' || op == '-') {
+        SValue *a = &vtop[-1], *b = &vtop[0];
+        if (is_idx_addr(a) && is_plain_const(b)) {
+            a->c.i += (op == '+') ? b->c.i : -b->c.i;
+            vtop--;
+            return;
+        }
+        if (op == '+' && is_idx_addr(b) && is_plain_const(a)) {
+            b->c.i += a->c.i;
+            vtop[-1] = *b;
+            vtop--;
+            return;
+        }
+        if (op == '+' && ((is_sym_addr(a) && is_int_val(b)) || (is_sym_addr(b) && is_int_val(a)))) {
+            Sym *sym;
+            int disp, ix;
+            if (is_sym_addr(a)) {
+                sym = a->sym;
+                disp = a->c.i;
+                ix = gv(RC_INT);            /* the index, vtop */
+            } else {
+                sym = b->sym;
+                disp = b->c.i;
+                vswap();
+                ix = gv(RC_INT);
+                vswap();
+            }
+            vtop--;
+            vtop->r = ix | VT_IDXSYM;
+            vtop->r2 = VT_CONST;
+            vtop->sym = sym;
+            vtop->c.i = disp;
+            return;
+        }
+    }
 
     length = type_size(&vtop[0].type, &align);
     r = vtop[-1].r;

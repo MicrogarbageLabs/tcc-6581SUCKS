@@ -326,6 +326,23 @@ void save_reg(int r)
                     pr("php\n");
                     args_size++;
                 }
+                if (p->r & VT_IDXSYM) {
+                    /* an indexed global: make its register the pointer
+                       first, then it spills like any (every copy of it
+                       on the stack is the same value) */
+                    SValue *q, iv = *p;
+                    for (q = vstack; q <= vtop; q++)
+                        if ((q->r & VT_VALMASK) == r
+                            && (!(q->r & VT_IDXSYM) || q->sym != iv.sym || q->c.i != iv.c.i))
+                            error("ICE: an indexed global's register shared");
+                    idx_to_ptr(r, &iv);
+                    for (q = vstack; q <= vtop; q++)
+                        if ((q->r & VT_VALMASK) == r) {
+                            q->r &= ~VT_IDXSYM;
+                            q->c.i = 0;
+                            q->sym = NULL;
+                        }
+                }
 #endif
                 r = p->r & VT_VALMASK;
                 type = &p->type;
@@ -642,6 +659,10 @@ int gv(int rc)
            - lvalue (need to dereference pointer)
            - already a register, but not in the right class */
         if (r >= VT_CONST || (vtop->r & VT_LVAL) || !(reg_classes[r] & rc)
+#ifdef TCC_TARGET_816
+            /* an indexed global's register holds the index, not the address */
+            || (vtop->r & VT_IDXSYM)
+#endif
             || ((vtop->type.t & VT_BTYPE) == VT_LLONG &&
 #ifdef TCC_TARGET_816
                 !(reg_classes[vtop->r2] & rc)))
