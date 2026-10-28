@@ -60,6 +60,7 @@ for n in $cases; do
     fi
     if [ $r = 0 ]; then
         echo "$n: $(tail -1 $B/$n.out)"
+        case $n in bench_*) grep '^cycles' $B/$n.out | sed 's/^/    /';; esac
         pass=$((pass + 1))
     else
         echo "$n:"

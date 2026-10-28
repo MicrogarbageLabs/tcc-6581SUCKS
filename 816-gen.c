@@ -385,6 +385,8 @@ int restore_stack(int fc)
 // a function call
 int args_size = 0;
 
+static int jcc_begin(int cond);
+
 int ll_workaround = 0;
 
 /**
@@ -659,7 +661,9 @@ void load(int r, SValue *sv)
             }
             return;
         } else if (v == VT_CMP) {
-            error("cmp");
+            /* a compare's flags to 0 or 1 */
+            int n = jcc_begin(sv->c.i);
+            pr("__ct%d:\nlda.w #1\nbra __ce%d\n__cs%d:\nlda.w #0\n__ce%d:\nsta.b tcc__r%d\n", n, n, n, n, r);
             return;
         } else if (v == VT_JMP || v == VT_JMPI) {
             t = v & 1; // inverted or not
@@ -1115,6 +1119,58 @@ void gjmp_addr(int a)
  * @return The index of the next instruction in the generated code. If a branch
  *         was generated, this could be the index of a jump target.
  */
+/* Compares leave the CPU flags and a VT_CMP value (vtop->c.i = the
+   compare token); the branch is made from the flags. cmp_keep_y asks a
+   compare to keep the difference in Y as well (the high word of a 32-bit
+   compare: gen_opl tests it after). */
+int cmp_keep_y = 0;
+static int cmp_labels = 0;
+
+/* the branches that skip to __cs<n> unless cond holds; the caller then
+   puts __ct<n>: and the jump taken when it holds, then __cs<n>:. After an
+   unsigned compare (cmp, or sbc) C and Z; after a signed one (sbc) N, V
+   and Z, with A the difference: N ^ V is "less than"
+   (6502.org/tutorials/compare_beyond.html) */
+static int jcc_begin(int cond)
+{
+    int n = cmp_labels++;
+    switch (cond) {
+    case TOK_EQ:
+        pr("bne __cs%d\n", n);
+        break;
+    case TOK_NE:
+        pr("beq __cs%d\n", n);
+        break;
+    case TOK_ULT:
+        pr("bcs __cs%d\n", n);
+        break;
+    case TOK_UGE:
+        pr("bcc __cs%d\n", n);
+        break;
+    case TOK_UGT:
+        pr("beq __cs%d\nbcc __cs%d\n", n, n);
+        break;
+    case TOK_ULE:
+        pr("bcc __ct%d\nbne __cs%d\n", n, n);
+        break;
+    case TOK_LT:
+        pr("bvc __ca%d\neor #$8000\n__ca%d:\nbpl __cs%d\n", n, n, n);
+        break;
+    case TOK_GE:
+        pr("bvc __ca%d\neor #$8000\n__ca%d:\nbmi __cs%d\n", n, n, n);
+        break;
+    case TOK_GT:
+        pr("beq __cs%d\nbvc __ca%d\neor #$8000\n__ca%d:\nbmi __cs%d\n", n, n, n, n);
+        break;
+    case TOK_LE:
+        pr("beq __ct%d\nbvc __ca%d\neor #$8000\n__ca%d:\nbpl __cs%d\n", n, n, n, n);
+        break;
+    default:
+        error("unknown compare 0x%x", cond);
+    }
+    return n;
+}
+
 int gtst(int inv, int t)
 {
     int v, r;
@@ -1122,23 +1178,16 @@ int gtst(int inv, int t)
     r = ind;
     pr("; gtst inv %d t %d v %d r %d ind %d\n", inv, t, v, r, ind);
     if (v == VT_CMP) {
+        int n;
         pr("; cmp op 0x%x inv %d v %d r %d\n", vtop->c.i, inv, v, r);
-        // gsym(t);
-        switch (vtop->c.i) {
-        case TOK_NE:
-            // remember that we need a label to jump to
-            ensure_jump_capacity();
-            jump[jumps][0] = r;
-            pr("; cmp ne\n");
-            // branches (too short) pr("b%s " LOCAL_LABEL "\n", inv?"eq":"ne", jumps++);
-            pr("b%s +\n", inv ? "ne" : "eq");
-            gsym(t);
-            pr("brl " LOCAL_LABEL "\n+\n", jumps++);
-            break;
-        default:
-            error("unknown compare");
-            break;
-        }
+        /* jump when the compare holds (inv: when it doesn't); chain t's
+           jumps land on the brl and go on from there */
+        ensure_jump_capacity();
+        jump[jumps][0] = r;
+        n = jcc_begin(inv ? (vtop->c.i ^ 1) : vtop->c.i);
+        pr("__ct%d:\n", n);
+        gsym(t);
+        pr("brl " LOCAL_LABEL "\n__cs%d:\n", jumps++, n);
         t = r;
     } else if (v == VT_JMP || v == VT_JMPI) {
         pr("; VT_jmp r %d t %d ji %d inv %d vtop->c.i %d\n", r, t, v & 1, inv, vtop->c.i);
@@ -1577,96 +1626,34 @@ void gen_opi(int op)
 
     case TOK_EQ:
     case TOK_NE:
-        r5 = get_reg(RC_R5);
-        if (isconst) {
-            pr("; cmpr(n)eq tcc__r%d, #%d\n", r, fc);
-            pr("ldx #1\nlda.b tcc__r%d\nsec\nsbc #%d\n", r, fc);
-        } else {
-            pr("; cmpr(n)eq tcc__r%d, tcc__r%d\n", r, fr);
-            pr("ldx #1\nlda.b tcc__r%d\nsec\nsbc.b tcc__r%d\n", r, fr);
-        }
-        pr("tay\n"); // save for long long comparisons
-        if (op == TOK_EQ)
-            pr("beq +\n");
-        else
-            pr("bne +\n");
-        pr("dex\n+\nstx.b tcc__r%d\n", r5); // long long code does some wild branching and fucks up
-                                            // if the results of the compares it generates do not
-        // end up in the same register; unlikely to be a performance
-        // impediment: TCC does not usually use this register anyway
-        vtop->r = r5;
-        break;
-
-    case TOK_GT:
-    case TOK_LE:
-    case TOK_LT:
-    case TOK_GE:
-        // 65xxx signed compare logic from here: http://www.6502.org/tutorials/compare_beyond.html#5
-        r5 = get_reg(RC_R5);
-        if (isconst) {
-            pr("; cmpcd tcc__r%d, #%d\n", r, fc);
-            pr("ldx #1\nlda.b tcc__r%d\nsec\nsbc.w #%d\n", r, fc);
-        } else {
-            pr("; cmpcd tcc__r%d, tcc__r%d\n", r, fr);
-            pr("ldx #1\nlda.b tcc__r%d\nsec\nsbc.b tcc__r%d\n", r, fr);
-        }
-        pr("tay\n"); // may need that later for long long
-        if (op == TOK_GT)
-            pr("beq ++\n"); // greater than => equality not good, result 0
-        else if (op == TOK_LE)
-            pr("beq +++\n"); // less than or equal => equality good, result 1
-        pr("bvc +\neor #$8000\n+\n");
-        switch (op) {
-        case TOK_GT:
-            pr("bpl +++\n");
-            break;
-        case TOK_LE:
-            pr("bmi +++\n");
-            break;
-        case TOK_LT:
-            pr("bmi +++\n");
-            break;
-        case TOK_GE:
-            pr("bpl +++\n");
-            break;
-        default:
-            error("don't know how to handle signed 0x%x\n", op);
-        }
-        pr("++\ndex\n+++\nstx.b tcc__r%d\n", r5); // see TOK_EQ/TOK_NE
-        vtop->r = r5;
-        break;
     case TOK_UGT:
     case TOK_ULE:
     case TOK_ULT:
     case TOK_UGE:
-        r5 = get_reg(RC_R5);
-        if (isconst) {
-            pr("; ucmpcd tcc__r%d, #%d\n", r, fc);
-            pr("ldx #1\nlda.b tcc__r%d\nsec\nsbc.w #%d\n", r, fc);
-        } else {
-            pr("; ucmpcd tcc__r%d, tcc__r%d\n", r, fr);
-            pr("ldx #1\nlda.b tcc__r%d\nsec\nsbc.b tcc__r%d\n", r, fr);
-        }
-        pr("tay\n"); // needed for long long comparisons
-        switch (op) {
-        case TOK_UGT:
-            pr("beq +\nbcs ++\n");
-            break;
-        case TOK_ULE:
-            pr("beq ++\nbcc ++\n");
-            break;
-        case TOK_ULT:
-            pr("bcc ++\n");
-            break;
-        case TOK_UGE:
-            pr("bcs ++\n");
-            break;
-        default:
-            error("don't know how to handle 0x%x\n", op);
-        }
-        pr("+ dex\n++\nstx.b tcc__r%d\n", r5); // see TOK_EQ/TOK_NE
-        vtop->r = r5;
+    case TOK_GT:
+    case TOK_LE:
+    case TOK_LT:
+    case TOK_GE: {
+        /* the flags and a VT_CMP: gtst branches on them, load turns them
+           into 0 or 1 when the value is wanted. Signed compares need V,
+           so sbc; the rest cmp, unless gen_opl wants the difference in Y */
+        int is_signed = (op == TOK_GT || op == TOK_LE || op == TOK_LT || op == TOK_GE);
+        char opnd[64];
+        if (isconst)
+            snprintf(opnd, sizeof opnd, ".w #%d", fc & 0xffff);
+        else
+            snprintf(opnd, sizeof opnd, ".b tcc__r%d", fr);
+        pr("; cmp 0x%x tcc__r%d, %s\n", op, r, opnd);
+        if (is_signed || cmp_keep_y)
+            pr("lda.b tcc__r%d\nsec\nsbc%s\n", r, opnd);
+        else
+            pr("lda.b tcc__r%d\ncmp%s\n", r, opnd);
+        if (cmp_keep_y)
+            pr("tay\n");
+        vtop->r = VT_CMP;
+        vtop->c.i = op;
         break;
+    }
     case TOK_SAR:
     case TOK_SHR:
     case TOK_SHL:

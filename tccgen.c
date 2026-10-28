@@ -310,12 +310,22 @@ void save_reg(int r)
 
     saved = 0;
     l = 0;
+#ifdef TCC_TARGET_816
+    /* a compare's flags may be waiting at vtop (VT_CMP): the spill's lda
+       would change them, so php/plp around it, one byte more on the stack
+       for the locals' offsets meanwhile */
+    int keep_flags = (vtop >= vstack && (vtop->r & VT_VALMASK) == VT_CMP);
+#endif
     for (p = vstack; p <= vtop; p++) {
         if ((p->r & VT_VALMASK) == r
             || ((p->type.t & VT_BTYPE) == VT_LLONG && (p->r2 & VT_VALMASK) == r)) {
             if (!saved) {
 #ifdef TCC_TARGET_816
                 pr("; saveregging\n");
+                if (keep_flags) {
+                    pr("php\n");
+                    args_size++;
+                }
 #endif
                 r = p->r & VT_VALMASK;
                 type = &p->type;
@@ -350,6 +360,12 @@ void save_reg(int r)
 #endif
                 l = loc;
                 saved = 1;
+#ifdef TCC_TARGET_816
+                if (keep_flags) {
+                    args_size--;
+                    pr("plp\n");
+                }
+#endif
             }
             if (p->r & VT_LVAL) {
                 p->r = (p->r & ~(VT_VALMASK | VT_BOUNDED)) | VT_LLOCAL;
@@ -1188,7 +1204,13 @@ void gen_opl(int op)
             op1 = TOK_UGE;
         a = 0;
         b = 0;
+#ifdef TCC_TARGET_816
+        cmp_keep_y = 1;         /* the high words' difference in Y, for the tya below */
         gen_op(op1);
+        cmp_keep_y = 0;
+#else
+        gen_op(op1);
+#endif
         if (op1 != TOK_NE) {
             a = gtst(1, 0);
         }
