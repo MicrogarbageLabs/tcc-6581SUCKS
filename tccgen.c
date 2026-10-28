@@ -4141,6 +4141,72 @@ static void expr_cond(DiscardedExprContext *dctx)
         }
     } else {
         expr_lor(dctx);
+        if (tok == '?' && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST
+            && !is_float(vtop->type.t)) {
+            /* a constant condition: compile only the branch it picks, the
+               other with no code, for its type. Before, both were compiled
+               with jumps around them, so a ?: on constants in a macro
+               became runtime branches. */
+            CType boolean;
+            SValue cond, first;
+            int c, saved = nocode_wanted;
+            cond = *vtop;
+            boolean.t = VT_BOOL;
+            gen_cast(&boolean);
+            c = vtop->c.i;
+            vtop--;
+            next();
+            if (tok == ':' && gnu_ext) {
+                vtop++;
+                *vtop = cond;       /* a ?: b: the condition is the value */
+            } else {
+                if (!c)
+                    nocode_wanted = 1;
+                gexpr(NULL);
+                nocode_wanted = saved;
+            }
+            first = *vtop;
+            vtop--;                 /* no vpop so that FP stack is not flushed */
+            skip(':');
+            if (c)
+                nocode_wanted = 1;
+            expr_cond(NULL);
+            nocode_wanted = saved;
+            type1 = first.type;
+            type2 = vtop->type;
+            if (c)
+                *vtop = first;
+            t1 = type1.t;
+            bt1 = t1 & VT_BTYPE;
+            t2 = type2.t;
+            bt2 = t2 & VT_BTYPE;
+            /* the result type from both, as below, for arithmetic types;
+               otherwise the chosen branch's own */
+            if (is_float(bt1) || is_float(bt2)) {
+                if (bt1 == VT_LDOUBLE || bt2 == VT_LDOUBLE)
+                    type.t = VT_LDOUBLE;
+                else if (bt1 == VT_DOUBLE || bt2 == VT_DOUBLE)
+                    type.t = VT_DOUBLE;
+                else
+                    type.t = VT_FLOAT;
+                gen_cast(&type);
+            } else if ((is_integer_btype(bt1) || bt1 == VT_BOOL)
+                       && (is_integer_btype(bt2) || bt2 == VT_BOOL)) {
+                if (bt1 == VT_LLONG || bt2 == VT_LLONG) {
+                    type.t = VT_LLONG;
+                    if ((t1 & (VT_BTYPE | VT_UNSIGNED)) == (VT_LLONG | VT_UNSIGNED)
+                        || (t2 & (VT_BTYPE | VT_UNSIGNED)) == (VT_LLONG | VT_UNSIGNED))
+                        type.t |= VT_UNSIGNED;
+                } else {
+                    type.t = VT_INT;
+                    if ((t1 & (VT_BTYPE | VT_UNSIGNED)) == (VT_INT | VT_UNSIGNED)
+                        || (t2 & (VT_BTYPE | VT_UNSIGNED)) == (VT_INT | VT_UNSIGNED))
+                        type.t |= VT_UNSIGNED;
+                }
+                gen_cast(&type);
+            }
+            return;
+        }
         if (tok == '?') {
             next();
             if (vtop != vstack) {

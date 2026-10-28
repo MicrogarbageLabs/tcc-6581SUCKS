@@ -1143,8 +1143,19 @@ int gtst(int inv, int t)
     } else if (v == VT_JMP || v == VT_JMPI) {
         pr("; VT_jmp r %d t %d ji %d inv %d vtop->c.i %d\n", r, t, v & 1, inv, vtop->c.i);
         if ((v & 1) == inv) {
-            gsym(t);
-            t = vtop->c.i;
+            /* merge chain t into the value's chain: both jump where it
+               will. (This was gsym(t), which sent t's jumps HERE, to the
+               other outcome: `x != 0xFFFFFFFF && x >= y` took its true
+               path when x was 0xFFFFFFFF.) A chain is every jump keyed
+               with its id (gjmp re-keys the same way). */
+            int i;
+            if (t && vtop->c.i) {
+                for (i = 0; i < jumps; i++)
+                    if (jump[i][0] == t)
+                        jump[i][0] = vtop->c.i;
+                t = vtop->c.i;
+            } else if (vtop->c.i)
+                t = vtop->c.i;
         } else {
             t = gjmp(t);
             gsym(vtop->c.i);
