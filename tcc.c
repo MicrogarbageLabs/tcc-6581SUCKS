@@ -414,6 +414,15 @@ int parse_args(TCCState *s, int argc, char **argv)
             case TCC_OPTION_H:
                 s->hirom_comp = 1;
                 break;
+            case TCC_OPTION_m:
+                /* -mhx422 (or -m_hx422): multiply on the HX-422 cart's
+                   hardware multiplier; __HX422_MUL__ tells the code */
+                if (!strcmp(optarg, "hx422") || !strcmp(optarg, "_hx422")) {
+                    s->hx422_mul = 1;
+                    tcc_define_symbol(s, "__HX422_MUL__", "1");
+                } else
+                    error("unknown option '-m%s' (816-tcc knows -mhx422)", optarg);
+                break;
             case TCC_OPTION_F:
                 s->fastrom_comp = 1;
                 break;

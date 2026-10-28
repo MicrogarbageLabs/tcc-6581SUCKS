@@ -1590,6 +1590,12 @@ void gen_opi(int op)
                 if (m == 0) {
                     skipcall = 1;
                     pr("; mul #0\nlda.w #0\n");
+                } else if (tcc_state->hx422_mul && cost > 25) {
+                    /* the HX-422 multiplier beats shifts and adds here:
+                       about 25 cycles */
+                    skipcall = 1;
+                    pr("; mul #%d (HX-422 multiplier)\n", fc);
+                    pr("lda.w #%d\nsta.l $003C30\nlda.b tcc__r%d\nsta.l $003C32\nlda.l $003C34\n", fc & 0xffff, r);
                 } else if (cost < 90) {
                     skipcall = 1;
                     pr("; mul #%d (optimized: bits of %u, top down)\n", fc, m);
@@ -1608,6 +1614,12 @@ void gen_opi(int op)
                 break;
             }
             }
+        } else if (tcc_state->hx422_mul) {
+            /* the HX-422 cart's multiplier: write A and B, read the
+               product (its low word is the same signed or not) */
+            skipcall = 1;
+            pr("; mul tcc__r%d,tcc__r%d (HX-422 multiplier)\n", fr, r);
+            pr("lda.b tcc__r%d\nsta.l $003C30\nlda.b tcc__r%d\nsta.l $003C32\nlda.l $003C34\n", fr, r);
         } else {
             pr("; mul tcc__r%d,tcc__r%d\n", fr, r);
             pr("lda.b tcc__r%d\nsta.b tcc__r9\n", fr);
@@ -1624,6 +1636,12 @@ void gen_opi(int op)
         c = vtop[0].r;
         vtop[0].r = get_reg(RC_INT);
         pr("; umull tcc__r%d, tcc__r%d => tcc__r%d/tcc__r%d\n", c, vtop[1].r, vtop->r, r);
+        if (tcc_state->hx422_mul) {
+            /* the HX-422 multiplier's unsigned 32-bit product */
+            pr("lda.b tcc__r%d\nsta.l $003C30\nlda.b tcc__r%d\nsta.l $003C32\n", c, vtop[1].r);
+            pr("lda.l $003C34\nsta.b tcc__r%d\nlda.l $003C36\nsta.b tcc__r%d\n", vtop->r, r);
+            break;
+        }
         pr("lda.b tcc__r%d\nsta.b tcc__r9\nstz.b tcc__r9h\nlda.b tcc__r%d\nsta.b tcc__r10\nstz.b "
            "tcc__r10h\n",
            c,

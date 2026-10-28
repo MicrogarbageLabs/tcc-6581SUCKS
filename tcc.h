@@ -497,6 +497,9 @@ struct TCCState
     int hirom_comp;
     /* if true, compile FastRom libraries */
     int fastrom_comp;
+    /* -mhx422: 16-bit multiplies on the HX-422 cart's hardware multiplier
+       ($00:3C30, core rev 0.35+) instead of tcc__mul */
+    int hx422_mul;
 #ifdef CONFIG_TCC_BCHECK
     /* compile with built-in memory and bounds checker */
     int do_bounds_check;

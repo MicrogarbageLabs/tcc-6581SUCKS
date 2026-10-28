@@ -8,8 +8,9 @@
  *  the low 512 KB read-only (a write there fails the test: on the cart it
  *  goes nowhere); $7E-$7F WRAM, its first 8 KB mirrored in the system
  *  banks; $00-$3F/$80-$BF:8000-FFFF mirror PSRAM. The CPU's multiply and
- *  divide registers ($4202-$4206 -> $4214-$4217) work and answer at once;
- *  every other I/O address reads 0.
+ *  divide registers ($4202-$4206 -> $4214-$4217) work and answer at once,
+ *  and so does the HX-422 multiplier (A $3C30, B $3C32; A*B unsigned at
+ *  $3C34, signed at $3C38, 32 bits each); every other I/O address reads 0.
  *
  *  The test talks through WDM (tests/rt/test.asm). What it prints goes to
  *  stdout, then a last line: PASS, or FAIL and why. A BRK, a write to the
@@ -33,6 +34,7 @@
 static uint8_t *psram, wram[0x20000];
 static uint8_t io_mula, io_mulb;
 static uint16_t io_dividend, io_quot, io_res;
+static uint16_t hx_ma, hx_mb;   /* the HX-422 multiplier's operands ($3C30, $3C32) */
 
 static int quiet, show_cycles, trace;
 static int done, fails, checks;
@@ -51,6 +53,20 @@ static uint32_t psram_of(uint8_t bank, uint16_t addr)
 
 static uint8_t io_read(uint16_t a)
 {
+    if (a >= 0x3C30 && a <= 0x3C3B) {
+        uint32_t u = (uint32_t) hx_ma * hx_mb;
+        uint32_t sg = (uint32_t) ((int32_t) (int16_t) hx_ma * (int32_t) (int16_t) hx_mb);
+        switch (a) {
+        case 0x3C30: return hx_ma & 0xFF;
+        case 0x3C31: return hx_ma >> 8;
+        case 0x3C32: return hx_mb & 0xFF;
+        case 0x3C33: return hx_mb >> 8;
+        default:
+            if (a < 0x3C38)
+                return (u >> (8 * (a - 0x3C34))) & 0xFF;
+            return (sg >> (8 * (a - 0x3C38))) & 0xFF;
+        }
+    }
     switch (a) {
     case 0x4214: return io_quot & 0xFF;
     case 0x4215: return io_quot >> 8;
@@ -63,6 +79,10 @@ static uint8_t io_read(uint16_t a)
 static void io_write(uint16_t a, uint8_t v)
 {
     switch (a) {
+    case 0x3C30: hx_ma = (hx_ma & 0xFF00) | v; break;
+    case 0x3C31: hx_ma = (hx_ma & 0x00FF) | (v << 8); break;
+    case 0x3C32: hx_mb = (hx_mb & 0xFF00) | v; break;
+    case 0x3C33: hx_mb = (hx_mb & 0x00FF) | (v << 8); break;
     case 0x4202: io_mula = v; break;
     case 0x4203: io_mulb = v; io_res = io_mula * io_mulb; break;
     case 0x4204: io_dividend = (io_dividend & 0xFF00) | v; break;
