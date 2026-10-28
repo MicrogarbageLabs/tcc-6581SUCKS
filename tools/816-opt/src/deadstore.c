@@ -542,6 +542,41 @@ static int reads_flags(const line_t *l)
     return cond || is(l, "php") || is(l, "adc") || is(l, "sbc") || is(l, "rol") || is(l, "ror");
 }
 
+/* A is written before it's read: a load, a pull or a transfer into it */
+static int a_overwritten(const line_t *l)
+{
+    return is(l, "lda") || is(l, "pla") || is(l, "tya") || is(l, "txa") || is(l, "tdc") || is(l, "tsc")
+           || is(l, "tsa");
+}
+
+/* A is dead after line i: the next instruction overwrites it or returns;
+   an unconditional jump is followed to its target's first instruction */
+static int a_dead_after(flow_t *F, size_t i)
+{
+    size_t j = i + 1;
+    int hops;
+    for (hops = 0; hops < 4; hops++) {
+        line_t *l;
+        while (j < F->n && (F->L[j].kind == K_NONE || (F->L[j].kind == K_LABEL && !F->L[j].labelled)))
+            j++;
+        if (j >= F->n)
+            return 0;
+        l = &F->L[j];
+        if (l->kind != K_INSN)
+            return 0;
+        if (a_overwritten(l))
+            return 1;
+        if (is(l, "rtl") || is(l, "rts"))
+            return 1;           /* the result goes back in tcc__r0, not A */
+        if ((is(l, "bra") || is(l, "brl") || is(l, "jmp")) && l->nsucc == 1 && !l->exit) {
+            j = (size_t) l->succ[0];
+            continue;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 #define WINDOW 16
 
 size_t forwardOperands(dynArray *file)
@@ -565,6 +600,25 @@ size_t forwardOperands(dynArray *file)
 
         if (gone[i] || a->kind != K_INSN || a->keep)
             continue;
+
+        /* lda M / inc a / sta M  ->  inc M (dec too), M direct page or
+           absolute, when A is dead after: the same N and Z, carry untouched */
+        if (is(a, "lda") && !a->m8 && i + 2 < F.n && !gone[i + 1] && !gone[i + 2]
+            && (!strncmp(a->rest, ".b ", 3) || !strncmp(a->rest, ".w ", 3)) && !strchr(a->op, ',')
+            && !strchr(a->op, '#') && !strchr(a->op, '[') && !strchr(a->op, '(') && !regs_in(a->op)) {
+            line_t *m = &F.L[i + 1], *s = &F.L[i + 2];
+            int incdec = (is(m, "inc") || is(m, "dec")) && !strcmp(m->op, "a");
+            if (incdec && !m->labelled && !m->keep && is(s, "sta") && !s->labelled && !s->keep && !s->m8
+                && !strcmp(s->rest, a->rest) && a_dead_after(&F, i + 2)) {
+                snprintf(buf, sizeof buf, "%s%s", m->mn, a->rest);
+                replace_line(file, i, buf);
+                drop_line(file, i + 1);
+                drop_line(file, i + 2);
+                gone[i] = gone[i + 1] = gone[i + 2] = 1;
+                done++;
+                continue;
+            }
+        }
 
         /* stz rN / lda rN  ->  lda.w #0 */
         r = stored_reg(a);

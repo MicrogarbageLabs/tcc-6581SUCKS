@@ -510,6 +510,8 @@ void gaddrof(void)
        it has no address to give */
     if ((vtop->r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && FC_IS_SLOT(vtop->c.ul))
         error("can't take the address of a fastcall parameter (copy it to a local)");
+    if ((vtop->r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && DP_IS_SLOT(vtop->c.ul))
+        error("ICE: the address of a direct page local (the prescan missed a '&')");
 #endif
     vtop->r &= ~VT_LVAL;
     /* tricky: if saved lvalue, then we can go back to lvalue */
@@ -5488,6 +5490,17 @@ static void decl_initializer_alloc(
     }
     if ((r & VT_VALMASK) == VT_LOCAL) {
         sec = NULL;
+#ifdef TCC_TARGET_816
+        {
+            /* one of the locals dp_prescan chose: in a direct page slot */
+            int k = v ? dp_slot_for(v, type) : -1;
+            if (k >= 0) {
+                addr = DP_SLOT + 2 * k;
+                sym_push(v, type, r, addr);
+                goto local_done;
+            }
+        }
+#endif
 #ifdef CONFIG_TCC_BCHECK
         if (tcc_state->do_bounds_check && (type->t & VT_ARRAY))
             loc--;
@@ -5626,6 +5639,9 @@ static void decl_initializer_alloc(
         }
 #endif
     }
+#ifdef TCC_TARGET_816
+local_done:                     /* a direct page local joins here, addr its slot */
+#endif
     if (has_init) {
         decl_initializer(type, sec, addr, 1, 0);
         /* restore parse state if needed */
@@ -5712,11 +5728,52 @@ static void gen_function(Sym *sym)
         put_func_debug(sym);
     /* push a dummy symbol to enable local sym storage */
     sym_push2(&local_stack, SYM_FIELD, 0, 0);
+#ifdef TCC_TARGET_816
+    {
+        /* the body's tokens first, for dp_prescan to choose the locals
+           that live in the direct page; then the body from them */
+        TokenString body;
+        ParseState saved;
+        int *ids = NULL, nids = 0, cap = 0, level = 0;
+        tok_str_new(&body);
+        for (;;) {
+            int t = tok;
+            if (t == TOK_EOF || t < 0)
+                error("unexpected end of file in a function");
+            tok_str_add_tok(&body);
+            if (nids == cap) {
+                cap = cap ? cap * 2 : 256;
+                ids = tcc_realloc(ids, cap * sizeof *ids);
+            }
+            ids[nids++] = t;
+            next();
+            if (t == '{')
+                level++;
+            else if (t == '}' && --level == 0)
+                break;
+        }
+        tok_str_add(&body, -1);
+        tok_str_add(&body, 0);
+        dp_prescan(ids, nids);
+        tcc_free(ids);
+        save_parse_state(&saved);
+        macro_ptr = body.str;
+        next();
+        gfunc_prolog(&sym->type);
+        rsym = 0;
+        block(NULL, NULL, NULL, NULL, 0, 0);
+        gsym(rsym);
+        gfunc_epilog();
+        restore_parse_state(&saved);
+        tok_str_free(body.str);
+    }
+#else
     gfunc_prolog(&sym->type);
     rsym = 0;
     block(NULL, NULL, NULL, NULL, 0, 0);
     gsym(rsym);
     gfunc_epilog();
+#endif
     cur_text_section->data_offset = ind;
     label_pop(&global_label_stack, NULL);
     sym_pop(&local_stack, NULL); /* reset local stack */

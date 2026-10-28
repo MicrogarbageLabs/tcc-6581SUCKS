@@ -59,6 +59,10 @@ tcc__a0 dsb 2                           ; fastcall / regparm parameter slots (81
 tcc__a1 dsb 2
 tcc__a2 dsb 2
 tcc__a3 dsb 2
+tcc__l0 dsb 2                           ; locals kept in the direct page, callee-saved (816-tcc fork)
+tcc__l1 dsb 2
+tcc__l2 dsb 2
+tcc__l3 dsb 2                           ; the page is 64 bytes: the vblank callback's own page is too
 .ENDS
 
 ; Initialised globals live in ROM ("glob.data") and are copied to WRAM

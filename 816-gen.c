@@ -441,6 +441,139 @@ static int fc_fits(CType *t)
     return type_size(t, &align) <= 2;
 }
 
+/* Locals in the direct page: tcc__l0..l3, callee-saved. Before a function
+   is compiled, dp_prescan looks over its body's tokens and picks up to
+   DP_MAX names used most inside loops (twice at least, never after a '&',
+   not called, not a member); the first declaration of each, if it's a
+   scalar of 2 bytes or less, lives in a slot: a VT_LOCAL lvalue at offset
+   DP_SLOT + 2 * k. A function saves the slots it used on entry and puts
+   them back on exit (__<fn>_dpu<k> / __<fn>_dps<k>, defined at its end),
+   so callees, recursion and the vblank callback (its own page) leave them
+   alone. The prescan only chooses: getting it wrong costs speed, not
+   correctness. */
+#define DP_SLOT 0x7E00
+#define DP_MAX 4
+#define DP_IS_SLOT(c) ((unsigned) (c) >= DP_SLOT && (unsigned) (c) < DP_SLOT + 2 * DP_MAX)
+static int dp_cand[DP_MAX];     /* the chosen names (token ids) */
+static int dp_ncand;
+static int dp_used[DP_MAX];     /* a declaration got the slot */
+
+void dp_prescan(int *ids, int n)
+{
+    int *depth = calloc(n + 1, sizeof *depth);
+    int *weight, i, k;
+    if (!depth)
+        error("out of memory");
+    dp_ncand = 0;
+    for (k = 0; k < DP_MAX; k++)
+        dp_used[k] = 0;
+
+    /* the loops' extents: for/while from the keyword through the header
+       and the body (a block, or up to its ';'); do through its body */
+    for (i = 0; i < n; i++) {
+        int b, end = -1, lvl;
+        if (ids[i] != TOK_FOR && ids[i] != TOK_WHILE && ids[i] != TOK_DO)
+            continue;
+        b = i + 1;
+        if (ids[i] != TOK_DO) {
+            if (b >= n || ids[b] != '(')
+                continue;
+            for (lvl = 0; b < n; b++) {
+                if (ids[b] == '(')
+                    lvl++;
+                else if (ids[b] == ')' && --lvl == 0)
+                    break;
+            }
+            b++;
+        }
+        if (b >= n)
+            continue;
+        if (ids[b] == '{') {
+            for (lvl = 0, end = b; end < n; end++) {
+                if (ids[end] == '{')
+                    lvl++;
+                else if (ids[end] == '}' && --lvl == 0)
+                    break;
+            }
+        } else {
+            int par = 0, br = 0;
+            for (end = b; end < n; end++) {
+                if (ids[end] == '(')
+                    par++;
+                else if (ids[end] == ')')
+                    par--;
+                else if (ids[end] == '{')
+                    br++;
+                else if (ids[end] == '}')
+                    br--;
+                else if (ids[end] == ';' && par <= 0 && br <= 0)
+                    break;
+            }
+        }
+        depth[i]++;
+        if (end < n)
+            depth[end + 1]--;
+    }
+    for (i = 1; i < n; i++)
+        depth[i] += depth[i - 1];
+
+    /* weigh each name: 1 outside a loop, 8 in one, 32 deeper */
+    weight = calloc(n, sizeof *weight);
+    if (!weight)
+        error("out of memory");
+    for (i = 0; i < n; i++) {
+        int t = ids[i], j, w, excluded = 0;
+        if (t < TOK_UIDENT)
+            continue;
+        if (i + 1 < n && ids[i + 1] == '(')
+            excluded = 1;                       /* a call */
+        if (i > 0 && (ids[i - 1] == '.' || ids[i - 1] == TOK_ARROW))
+            excluded = 1;                       /* a member */
+        for (j = i - 1; j >= 0 && ids[j] == '('; j--)
+            ;
+        if (j >= 0 && ids[j] == '&')
+            excluded = 2;                       /* its address, maybe */
+        w = depth[i] == 0 ? 1 : depth[i] == 1 ? 8 : 32;
+        for (j = 0; j < i; j++)
+            if (ids[j] == t)
+                break;
+        /* keep the totals on the name's first occurrence */
+        if (weight[j] >= 0)
+            weight[j] = excluded == 2 ? -1 : (excluded ? weight[j] : weight[j] + w);
+        if (excluded == 2)
+            weight[j] = -1;
+    }
+    /* the heaviest DP_MAX, 16 at least (two uses in a loop) */
+    for (k = 0; k < DP_MAX; k++) {
+        int best = -1, bw = 15;
+        for (i = 0; i < n; i++)
+            if (weight[i] > bw) {
+                bw = weight[i];
+                best = i;
+            }
+        if (best < 0)
+            break;
+        dp_cand[dp_ncand++] = ids[best];
+        weight[best] = 0;
+    }
+    free(depth);
+    free(weight);
+}
+
+/* the slot for a local being declared, or -1 */
+int dp_slot_for(int v, CType *type)
+{
+    int k;
+    if (!fc_fits(type) || (type->t & VT_VOLATILE))
+        return -1;
+    for (k = 0; k < dp_ncand; k++)
+        if (dp_cand[k] == (v & ~SYM_FIELD) && !dp_used[k]) {
+            dp_used[k] = 1;
+            return k;
+        }
+    return -1;
+}
+
 /* a slot parameter's operand: the slot, or the frame copy while setting
    up a call's slot arguments */
 static void fc_operand(char *buf, size_t n, int k)
@@ -562,6 +695,20 @@ void load(int r, SValue *sv)
         default:
             error("ICE idx load %d", length);
         }
+        return;
+    }
+    if (v == VT_LOCAL && DP_IS_SLOT(fc)) {      /* a local in the direct page */
+        int k = (fc - DP_SLOT) / 2;
+        if (!(fr & VT_LVAL))
+            error("ICE: the address of a direct page local");
+        pr("; ld%d dp local %d -> tcc__r%d\n", length, k, r);
+        if (length == 1) {
+            pr("lda.w #0\nsep #$20\nlda.b tcc__l%d\nrep #$20\n", k);
+            if (!(ft & VT_UNSIGNED))
+                pr("xba\nxba\nbpl +\nora.w #$ff00\n+\n");
+        } else
+            pr("lda.b tcc__l%d\n", k);
+        pr("sta.b tcc__r%d\n", r);
         return;
     }
     if (v == VT_LOCAL && FC_IS_SLOT(fc)) {      /* a fastcall parameter */
@@ -901,6 +1048,15 @@ void store(int r, SValue *sv)
         default:
             error("ICE idx store %d", length);
         }
+        return;
+    }
+    if ((fr & VT_VALMASK) == VT_LOCAL && (fr & VT_LVAL) && DP_IS_SLOT(fc)) {   /* a direct page local */
+        int k = (fc - DP_SLOT) / 2;
+        pr("; st%d tcc__r%d -> dp local %d\n", length, r, k);
+        if (length == 1)
+            pr("sep #$20\nlda.b tcc__r%d\nsta.b tcc__l%d\nrep #$20\n", r, k);
+        else
+            pr("lda.b tcc__r%d\nsta.b tcc__l%d\n", r, k);
         return;
     }
     if ((fr & VT_VALMASK) == VT_LOCAL && (fr & VT_LVAL) && FC_IS_SLOT(fc)) {   /* a fastcall parameter */
@@ -2407,6 +2563,10 @@ void gfunc_prolog(CType *func_type)
                 pr("lda.b tcc__a%d\nsta __%s_ps%d + __%s_locals + 1,s\n", k, current_fn, k, current_fn);
             pr(".endif\n");
         }
+        /* the direct page locals' slots it uses, saved (the prescan ran) */
+        for (k = 0; k < dp_ncand; k++)
+            pr(".ifgr __%s_dpu%d 0\nlda.b tcc__l%d\nsta __%s_dps%d + __%s_locals + 1,s\n.endif\n",
+               current_fn, k, k, current_fn, k, current_fn);
     }
     loc = 0; // huh squared?
 }
@@ -2444,6 +2604,11 @@ static void ensure_locals_capacity(void)
  */
 void gfunc_epilog(void)
 {
+    int k;
+    /* the direct page locals' slots back as the caller had them */
+    for (k = 0; k < dp_ncand; k++)
+        pr(".ifgr __%s_dpu%d 0\nlda __%s_dps%d + __%s_locals + 1,s\nsta.b tcc__l%d\n.endif\n",
+           current_fn, k, current_fn, k, current_fn, k);
     pr("; add sp, #__%s_locals\n", current_fn);
     pr(".ifgr __%s_locals 0\ntsa\nclc\nadc #__%s_locals\ntas\n.endif\n", current_fn, current_fn);
     pr("rtl\n");
@@ -2451,9 +2616,21 @@ void gfunc_epilog(void)
     pr(".ENDS\n");
     section_closed = 1;
 
+    /* the direct page locals: frame room to save each slot used */
+    for (k = 0; k < dp_ncand; k++) {
+        if (dp_used[k]) {
+            loc -= 2;
+            fc_add_def(".define __%s_dpu%d 1", current_fn, k);
+            fc_add_def(".define __%s_dps%d %d", current_fn, k, loc);
+        } else {
+            fc_add_def(".define __%s_dpu%d 0", current_fn, k);
+            fc_add_def(".define __%s_dps%d 0", current_fn, k);
+        }
+    }
+    dp_ncand = 0;
+
     /* fastcall parameters: a frame copy if the function made calls */
     if (fc_n) {
-        int k;
         fc_add_def(".define __%s_psave %d", current_fn, fc_calls ? 1 : 0);
         for (k = 0; k < fc_n; k++) {
             if (fc_calls) {

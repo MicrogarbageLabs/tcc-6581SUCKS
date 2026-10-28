@@ -62,6 +62,22 @@ static u16 idx_between(u16 i, u16 j)
 static u16 cmp_mem(u16 x) { return (x < g) + (x == h) * 2 + (x > g) * 4; }
 static u16 logic_mem(u16 x) { return (x & g) ^ (x | h); }
 
+/* lda M / inc a / sta M -> inc M only when A is dead after: here the
+   incremented value, or the old one, is used */
+u16 cnt;
+static u16 post_inc(void) { return cnt++; }
+static u16 pre_inc(void) { return ++cnt; }
+static u16 inc_then_use(void) { u16 t; cnt++; t = cnt * 2; return t; }
+static u16 local_counts(u16 n)
+{
+    u16 i, a = 0, b = 0;
+    for (i = 0; i < n; i++) {
+        a++;
+        b = a + i;
+    }
+    return a * 100 + b + i;
+}
+
 int main(void)
 {
     u16 i;
@@ -96,5 +112,12 @@ int main(void)
     CHECK(cmp_mem(60), 4);
     CHECK(cmp_mem(50), 0);
     CHECK(logic_mem(0x0F0F), (0x0F0F & 50) ^ (0x0F0F | 40));
+
+    cnt = 10;
+    CHECK(post_inc(), 10);
+    CHECK(cnt, 11);
+    CHECK(pre_inc(), 12);
+    CHECK(inc_then_use(), 26);
+    CHECK(local_counts(5), 500 + 9 + 5);
     return 0;
 }
