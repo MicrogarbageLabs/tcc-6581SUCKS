@@ -1795,6 +1795,9 @@ static void tcc_output_binary(TCCState *s1, FILE *f, const int *section_order)
     for (i = 0; i < localno; i++) {
         fprintf(f, ".define __%s_locals %d\n", locals[i], localnos[i]);
     }
+    /* fastcall parameters' frame copies (816-gen.c) */
+    for (i = 0; i < fc_ndefs; i++)
+        fprintf(f, "%s\n", fc_defs[i]);
 
     /* relocate sections
        this not only rewrites the pointers inside sections (with bogus

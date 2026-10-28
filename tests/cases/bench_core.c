@@ -12,6 +12,7 @@
      8  local u16 loop counter          for (l = 0; l < N; l++) sum += l
      9  global u16 loop counter         for (g = 0; g < N; g++) sum += g
     10  u16 multiply                    a * b
+    11  a fastcall with 3 u16 args      fadd3(a, b, c)
 */
 #include "test.h"
 
@@ -26,6 +27,7 @@ u16 sum, g;
 u32 acc32;
 
 static u16 add3(u16 a, u16 b, u16 c) { return a + b + c; }
+static u16 __attribute__((fastcall)) fadd3(u16 a, u16 b, u16 c) { return a + b + c; }
 
 int main(void)
 {
@@ -105,6 +107,13 @@ int main(void)
     for (i = 0; i < N; i++)
         sum += va * vb;
     t_timer_stop(10);
+    CHECK(sum, N * 15);
+
+    sum = 0;
+    t_timer_start();
+    for (i = 0; i < N; i++)
+        sum += fadd3(va, vb, vc);
+    t_timer_stop(11);
     CHECK(sum, N * 15);
     return 0;
 }

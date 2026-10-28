@@ -518,7 +518,9 @@ static int touches_index(const line_t *l, char r)
 static int plain_operand(const line_t *l)
 {
     const char *o = l->op;
-    if (!*o || strstr(o, "tcc__") || strchr(o, '[') || strchr(o, '('))
+    /* the pseudo-registers are out; tcc__a0.. (fastcall slots) are plain
+       direct page memory, stores to them caught by writes_memory */
+    if (!*o || regs_in(o) || strchr(o, '[') || strchr(o, '('))
         return 0;
     if (strstr(o, ",x") || strstr(o, ",X") || strstr(o, ",y") || strstr(o, ",Y"))
         return 0;
@@ -530,7 +532,7 @@ static int stack_relative(const line_t *l) { return strstr(l->op, ",s") || strst
 /* A is written without being read (so an earlier load into A is dead) */
 static int sets_a_fresh(const line_t *l)
 {
-    return (is(l, "lda") && !strstr(l->op, "tcc__") ? 1 : 0) || is(l, "pla") || is(l, "tya") || is(l, "txa")
+    return (is(l, "lda") && !regs_in(l->op) ? 1 : 0) || is(l, "pla") || is(l, "tya") || is(l, "txa")
            || is(l, "tdc") || is(l, "tsc") || is(l, "tsa");
 }
 

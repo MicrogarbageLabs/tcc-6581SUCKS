@@ -55,6 +55,10 @@ tcc__f3 dsb 2
 tcc__f3h dsb 2
 move_insn dsb 4                         ; 3 bytes mvn + 1 byte rts
 move_backwards_insn dsb 4               ; 3 bytes mvp + 1 byte rts
+tcc__a0 dsb 2                           ; fastcall / regparm parameter slots (816-tcc fork)
+tcc__a1 dsb 2
+tcc__a2 dsb 2
+tcc__a3 dsb 2
 .ENDS
 
 ; Initialised globals live in ROM ("glob.data") and are copied to WRAM

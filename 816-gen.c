@@ -387,6 +387,70 @@ int args_size = 0;
 
 static int jcc_begin(int cond);
 
+/* fastcall / regparm(n): the first 16-bit (or smaller) parameters arrive in
+   the direct page slots tcc__a0..a3 (crt0's register page) instead of on
+   the stack. The caller stores them there last, after every argument is
+   ready, and pushes only the rest. The callee reads them there: a
+   parameter is a VT_LOCAL lvalue at offset FC_SLOT + 2 * k. A callee that
+   makes calls itself copies them to its frame on entry (calls reuse the
+   slots), writes them through to that copy, puts them back after each call,
+   and reads its copy while setting up a call's slot arguments. Whether it
+   makes calls is known at its end: __<fn>_psave says so to the assembler,
+   as __<fn>_locals does the frame size. */
+#define FC_SLOT 0x7F00
+#define FC_MAX 4
+#define FC_IS_SLOT(c) ((unsigned) (c) >= FC_SLOT && (unsigned) (c) < FC_SLOT + 2 * FC_MAX)
+static int fc_n;                /* the current function's slot parameters */
+static int fc_calls;            /* it has made a call */
+static int fc_args_ctx;         /* setting up slot arguments: read the frame copy */
+char **fc_defs = NULL;          /* the .defines tccelf.c puts at the top */
+int fc_ndefs = 0, fc_defs_cap = 0;
+
+static void fc_add_def(const char *fmt, ...)
+{
+    char buf[MAXLEN];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (fc_ndefs == fc_defs_cap) {
+        fc_defs_cap = fc_defs_cap ? fc_defs_cap * 2 : 32;
+        fc_defs = realloc(fc_defs, fc_defs_cap * sizeof *fc_defs);
+        if (!fc_defs)
+            error("out of memory");
+    }
+    fc_defs[fc_ndefs++] = strdup(buf);
+}
+
+/* how many slots a calling convention uses */
+static int fc_nslots(int func_call)
+{
+    if (func_call == FUNC_FASTCALLW)
+        return FC_MAX;
+    if (func_call >= FUNC_FASTCALL1 && func_call <= FUNC_FASTCALL3)
+        return func_call - FUNC_FASTCALL1 + 1;
+    return 0;
+}
+
+/* a parameter that can live in a slot: 2 bytes or less, not float */
+static int fc_fits(CType *t)
+{
+    int align, bt = t->t & VT_BTYPE;
+    if (is_float(t->t) || bt == VT_STRUCT || bt == VT_LLONG || bt == VT_PTR || (t->t & VT_ARRAY))
+        return 0;
+    return type_size(t, &align) <= 2;
+}
+
+/* a slot parameter's operand: the slot, or the frame copy while setting
+   up a call's slot arguments */
+static void fc_operand(char *buf, size_t n, int k)
+{
+    if (fc_args_ctx)
+        snprintf(buf, n, " __%s_ps%d + %d + __%s_locals + 1,s", current_fn, k, args_size, current_fn);
+    else
+        snprintf(buf, n, ".b tcc__a%d", k);
+}
+
 /* An indexed global: a register value whose r has VT_IDXSYM is
    sym + c.i + (that register, a 16-bit byte offset). With VT_LVAL it is
    the element there: ldx.b tcc__rN / lda.l sym+c,x. Without, the address,
@@ -498,6 +562,21 @@ void load(int r, SValue *sv)
         default:
             error("ICE idx load %d", length);
         }
+        return;
+    }
+    if (v == VT_LOCAL && FC_IS_SLOT(fc)) {      /* a fastcall parameter */
+        char src[MAXLEN];
+        if (!(fr & VT_LVAL))
+            error("can't take the address of a fastcall parameter (copy it to a local)");
+        fc_operand(src, sizeof src, (fc - FC_SLOT) / 2);
+        pr("; ld%d fastcall param %d -> tcc__r%d\n", length, (fc - FC_SLOT) / 2, r);
+        if (length == 1) {
+            pr("lda.w #0\nsep #$20\nlda%s\nrep #$20\n", src);
+            if (!(ft & VT_UNSIGNED))
+                pr("xba\nxba\nbpl +\nora.w #$ff00\n+\n");
+        } else
+            pr("lda%s\n", src);
+        pr("sta.b tcc__r%d\n", r);
         return;
     }
     if (fr & VT_LVAL) {
@@ -824,6 +903,19 @@ void store(int r, SValue *sv)
         }
         return;
     }
+    if ((fr & VT_VALMASK) == VT_LOCAL && (fr & VT_LVAL) && FC_IS_SLOT(fc)) {   /* a fastcall parameter */
+        int k = (fc - FC_SLOT) / 2;
+        pr("; st%d tcc__r%d -> fastcall param %d\n", length, r, k);
+        if (length == 1)
+            pr("sep #$20\n");
+        pr("lda.b tcc__r%d\nsta.b tcc__a%d\n", r, k);
+        /* and its frame copy, when the function makes calls */
+        pr(".ifgr __%s_psave 0\nsta __%s_ps%d + %d + __%s_locals + 1,s\n.endif\n",
+           current_fn, current_fn, k, args_size, current_fn);
+        if (length == 1)
+            pr("rep #$20\n");
+        return;
+    }
 
     v = fr & VT_VALMASK;
     base = -1;
@@ -1020,7 +1112,35 @@ void gfunc_call(int nb_args)
        a memcpy call) */
     int restore_args_size = args_size;
 
+    /* which arguments go in fastcall slots: the callee's first fitting
+       parameters, the same rule gfunc_prolog applies */
+    int slot_of[256], pos, k;
+    {
+        Sym *fs = vtop[-nb_args].type.ref, *p;
+        int ns = fs ? fc_nslots(FUNC_CALL(fs->r)) : 0;
+        for (pos = 0; pos < nb_args && pos < 256; pos++)
+            slot_of[pos] = -1;
+        k = 0;
+        for (p = fs ? fs->next : NULL, pos = 0; p && pos < nb_args && pos < 256; p = p->next, pos++)
+            if (k < ns && fc_fits(&p->type))
+                slot_of[pos] = k++;
+    }
+    fc_calls = 1;
+
     for (i = 0; i < nb_args; i++) {
+        pos = nb_args - 1 - i;
+        if (pos < 256 && slot_of[pos] >= 0) {
+            /* into its slot, after every argument is ready (they are: the
+               caller's own slot parameters are read from its frame copy,
+               which the stores below can't touch) */
+            fc_args_ctx = 1;
+            r = gv(RC_INT);
+            fc_args_ctx = 0;
+            pr("; fastcall arg %d -> tcc__a%d\n", pos, slot_of[pos]);
+            pr("lda.b tcc__r%d\nsta.b tcc__a%d\n", r, slot_of[pos]);
+            vtop--;
+            continue;
+        }
         length = type_size(&vtop->type, &align);
         if (vtop->type.t & VT_ARRAY)
             length = PTR_SIZE;
@@ -1122,10 +1242,7 @@ void gfunc_call(int nb_args)
     func_sym = vtop->type.ref;
     func_call = func_sym->r;
 
-    /* fast call case */
-    if (func_call >= FUNC_FASTCALL1 && func_call <= FUNC_FASTCALL3) {
-        error("fastcall");
-    }
+    (void) func_call;
 
     pr("; call r 0x%x\n", vtop->r);
     if (vtop->r & VT_LVAL) {
@@ -1159,6 +1276,10 @@ void gfunc_call(int nb_args)
             pr("tsa\nclc\nadc #%d\ntas\n", args_size - restore_args_size);
     }
     args_size = restore_args_size;
+    /* the call may have reused the slots: this function's own fastcall
+       parameters back from its frame copy */
+    for (k = 0; k < fc_n; k++)
+        pr("lda __%s_ps%d + %d + __%s_locals + 1,s\nsta.b tcc__a%d\n", current_fn, k, args_size, current_fn, k);
     vtop--;
 }
 
@@ -2260,15 +2381,33 @@ void gfunc_prolog(CType *func_type)
 
     pr("\n%s:\n", current_fn);
 
-    while ((sym = sym->next)) {
-        CType *type = &sym->type;
-        sym_push(sym->v & ~SYM_FIELD, type, VT_LOCAL | VT_LVAL, addr);
-        size = type_size(type, &align);
-        addr += size;
-        n += size;
+    {
+        int ns = fc_nslots(FUNC_CALL(func_type->ref->r)), k;
+        fc_n = 0;
+        fc_calls = 0;
+        fc_args_ctx = 0;
+        while ((sym = sym->next)) {
+            CType *type = &sym->type;
+            if (fc_n < ns && fc_fits(type)) {   /* in a slot, not on the stack */
+                sym_push(sym->v & ~SYM_FIELD, type, VT_LOCAL | VT_LVAL, FC_SLOT + 2 * fc_n);
+                fc_n++;
+                continue;
+            }
+            sym_push(sym->v & ~SYM_FIELD, type, VT_LOCAL | VT_LVAL, addr);
+            size = type_size(type, &align);
+            addr += size;
+            n += size;
+        }
+        pr("; sub sp,#__%s_locals\n", current_fn);
+        pr(".ifgr __%s_locals 0\ntsa\nsec\nsbc #__%s_locals\ntas\n.endif\n", current_fn, current_fn);
+        if (fc_n) {
+            /* the slots to the frame, if the function makes calls */
+            pr(".ifgr __%s_psave 0\n", current_fn);
+            for (k = 0; k < fc_n; k++)
+                pr("lda.b tcc__a%d\nsta __%s_ps%d + __%s_locals + 1,s\n", k, current_fn, k, current_fn);
+            pr(".endif\n");
+        }
     }
-    pr("; sub sp,#__%s_locals\n", current_fn);
-    pr(".ifgr __%s_locals 0\ntsa\nsec\nsbc #__%s_locals\ntas\n.endif\n", current_fn, current_fn);
     loc = 0; // huh squared?
 }
 
@@ -2311,6 +2450,20 @@ void gfunc_epilog(void)
 
     pr(".ENDS\n");
     section_closed = 1;
+
+    /* fastcall parameters: a frame copy if the function made calls */
+    if (fc_n) {
+        int k;
+        fc_add_def(".define __%s_psave %d", current_fn, fc_calls ? 1 : 0);
+        for (k = 0; k < fc_n; k++) {
+            if (fc_calls) {
+                loc -= 2;
+                fc_add_def(".define __%s_ps%d %d", current_fn, k, loc);
+            } else
+                fc_add_def(".define __%s_ps%d 0", current_fn, k);
+        }
+        fc_n = 0;
+    }
 
     if (-loc > STACK_SIZE_LIMIT) {
         error("stack overflow");

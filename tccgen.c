@@ -505,6 +505,12 @@ void move_reg(int r, int s)
  */
 void gaddrof(void)
 {
+#ifdef TCC_TARGET_816
+    /* a fastcall parameter lives in a direct page slot that calls reuse:
+       it has no address to give */
+    if ((vtop->r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && FC_IS_SLOT(vtop->c.ul))
+        error("can't take the address of a fastcall parameter (copy it to a local)");
+#endif
     vtop->r &= ~VT_LVAL;
     /* tricky: if saved lvalue, then we can go back to lvalue */
     if ((vtop->r & VT_VALMASK) == VT_LLOCAL)
@@ -2740,7 +2746,9 @@ static void parse_attribute(AttributeDef *ad)
             case TOK_STDCALL3:
                 ad->func_call = FUNC_STDCALL;
                 break;
-#ifdef TCC_TARGET_I386
+#if defined(TCC_TARGET_I386) || defined(TCC_TARGET_816)
+            /* 816: the first 16-bit parameters in the direct page slots
+               tcc__a0..a3 (fastcall: up to 4, regparm(n): n, at most 3) */
             case TOK_REGPARM1:
             case TOK_REGPARM2:
                 skip('(');
