@@ -4666,6 +4666,54 @@ static void block(int *bsym, int *csym, int *case_sym, int *def_sym, int case_re
             a = gtst(1, 0);
         }
         skip(';');
+#ifdef TCC_TARGET_816
+        /* the increment after the body, so a pass is the test's branch and
+           one jump back, not the test, a jump over the increment, the
+           increment, a jump to the test and a jump from the body back to
+           the increment (about 6 cycles a pass less). Its tokens are kept
+           and replayed after the body, with the ')' that ends it so the
+           value-discarding i++ case still applies. */
+        if (tok != ')') {
+            TokenString inc_str;
+            ParseState saved;
+            int level = 0;
+            tok_str_new(&inc_str);
+            while (level > 0 || tok != ')') {
+                if (tok < 0)
+                    error("unexpected end of file in for");
+                if (tok == '(')
+                    level++;
+                else if (tok == ')')
+                    level--;
+                tok_str_add_tok(&inc_str);
+                next();
+            }
+            tok_str_add_tok(&inc_str);      /* the ')' */
+            tok_str_add(&inc_str, -1);
+            tok_str_add(&inc_str, 0);
+            skip(')');
+            block(&a, &b, case_sym, def_sym, case_reg, 0);
+            c = ind;                        /* continue comes here */
+            save_parse_state(&saved);
+            macro_ptr = inc_str.str;
+            next();
+            {
+                DiscardedExprContext for_incr_cand = {')'};
+                gexpr(&for_incr_cand);
+                vpop();
+            }
+            skip(')');
+            restore_parse_state(&saved);
+            tok_str_free(inc_str.str);
+        } else {
+            skip(')');
+            block(&a, &b, case_sym, def_sym, case_reg, 0);
+        }
+        (void) e;
+        gjmp_addr(d);
+        gsym(a);
+        gsym_addr(b, c);
+#else
         if (tok != ')') {
             e = gjmp(0);
             c = ind;
@@ -4680,6 +4728,7 @@ static void block(int *bsym, int *csym, int *case_sym, int *def_sym, int case_re
         gjmp_addr(c);
         gsym(a);
         gsym_addr(b, c);
+#endif
     } else if (tok == TOK_DO) {
         next();
         a = 0;
