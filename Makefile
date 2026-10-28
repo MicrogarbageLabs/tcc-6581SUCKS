@@ -141,9 +141,14 @@ config.mak:
 	@echo Running configure ...
 	@./configure
 
+# 816-opt, the peephole optimiser that runs on 816-tcc's output (PVSnesLib's
+# 2.0 plus this fork's fixes; zlib licence; needs PCRE2)
+opt:
+	$(MAKE) -C tools/816-opt
+
 # the compiler tests: each tests/cases/*.c built and run on a 65816
 # emulator (tests/README.md); needs PVSnesLib 4.5 at $PVSNESLIB_HOME
-test: $(PROGS)
+test: $(PROGS) opt
 	sh tests/run.sh
 
 # the emulator against Tom Harte's single-step tests (fetches a slice once)

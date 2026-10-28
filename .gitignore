@@ -18,3 +18,5 @@ tests/emu/sst/
 tests/build/
 *.exe
 tests/emu/sst_run
+tools/816-opt/build/
+tools/816-opt/816-opt

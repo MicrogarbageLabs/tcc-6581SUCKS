@@ -20,7 +20,12 @@ cd "$(dirname "$0")"
 T=$(pwd)
 PV=${PVSNESLIB_HOME:-"/c/Users/IP Freely/Documents/Source/pvsneslib_450_64b_windows/pvsneslib"}
 TCC=${TCC:-../816-tcc}
-OPT="$PV/devkitsnes/tools/816-opt"
+# 816-opt: ours (tools/816-opt, built by make) when it's there, else PVSnesLib's;
+# $OPT picks one. Ours takes -i/-o, PVSnesLib 4.5's writes to stdout.
+OPT=${OPT:-}
+if [ -z "$OPT" ]; then
+    if [ -x ../tools/816-opt/816-opt ] || [ -x ../tools/816-opt/816-opt.exe ]; then OPT=../tools/816-opt/816-opt; else OPT="$PV/devkitsnes/tools/816-opt"; fi
+fi
 CTF="$PV/devkitsnes/tools/constify"
 WLA="$PV/devkitsnes/bin/wla-65816"
 LINK="$PV/devkitsnes/bin/wlalink"
@@ -28,6 +33,10 @@ LIBTCC="$PV/pvsneslib/lib/HiROM_FastROM/libtcc.obj"
 B=build
 
 mkdir -p $B
+# the optimiser, whichever its command line
+run_opt() {
+    if "$OPT" -h 2>&1 | grep -q -- '--file-input'; then "$OPT" -q -i "$1" -o "$2"; else "$OPT" "$1" > "$2"; fi
+}
 [ -x "$TCC" ] || [ -x "$TCC.exe" ] || { echo "no $TCC: run make first"; exit 2; }
 gcc -O2 -Wall -o $B/run816 emu/run816.c emu/emu816.c || exit 2
 cp "$LIBTCC" $B/libtcc.obj
@@ -42,7 +51,7 @@ for n in $cases; do
     : > $log
     ok=1
     "$TCC" -Wall -I rt -c cases/$n.c -H -F -o $B/$n.ps >> $log 2>&1 &&
-        "$OPT" $B/$n.ps > $B/$n.asp 2>> $log &&
+        run_opt $B/$n.ps $B/$n.asp >> $log 2>&1 &&
         "$CTF" cases/$n.c $B/$n.asp $B/$n.asm >> $log 2>&1 &&
         "$WLA" -d -s -x -I rt -o $B/$n.obj $B/$n.asm >> $log 2>&1 &&
         printf '[objects]\n%s\n%s\n%s\n%s\n' $B/crt0.obj $B/test.obj $B/$n.obj $B/libtcc.obj > $B/$n.link &&
