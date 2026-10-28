@@ -1423,10 +1423,45 @@ void gen_opi(int op)
                 pr("; mul #255 (optimized: x*256-x)\n");
                 pr("lda.b tcc__r%d\nxba\nand #$ff00\nsec\nsbc.b tcc__r%d\n", r, r);
                 break;
-            default:
-                pr("; mul #%d, tcc__r%d\n", fc, r);
-                pr("lda.w #%d\nsta.b tcc__r9\n", fc);
+            default: {
+                /* any other constant: its bits from the top down
+                   (Horner), the running product in A and x added from its
+                   own register, so no scratch register (why the composite
+                   cases above were dropped). Mod 2^16, so signed is the
+                   same. A negative constant: by -c, then negate. Used when
+                   it beats tcc__mul (about 125 cycles with its set-up). */
+                unsigned m = fc & 0xffff, neg = 0;
+                int bits, adds = 0, b, cost;
+                if ((m & 0x8000) && m != 0x8000) {
+                    m = (0x10000 - m) & 0xffff;
+                    neg = 1;
+                }
+                for (b = 0; b < 16; b++)
+                    if (m & (1u << b))
+                        adds++;
+                for (bits = 16; bits > 0 && !(m & (1u << (bits - 1))); bits--)
+                    ;
+                cost = 4 + 2 * (bits - 1) + 5 * (adds - 1) + (neg ? 5 : 0);
+                if (m == 0) {
+                    skipcall = 1;
+                    pr("; mul #0\nlda.w #0\n");
+                } else if (cost < 90) {
+                    skipcall = 1;
+                    pr("; mul #%d (optimized: bits of %u, top down)\n", fc, m);
+                    pr("lda.b tcc__r%d\n", r);
+                    for (b = bits - 2; b >= 0; b--) {
+                        pr("asl a\n");
+                        if (m & (1u << b))
+                            pr("clc\nadc.b tcc__r%d\n", r);
+                    }
+                    if (neg)
+                        pr("eor.w #$ffff\ninc a\n");
+                } else {
+                    pr("; mul #%d, tcc__r%d\n", fc, r);
+                    pr("lda.w #%d\nsta.b tcc__r9\n", fc);
+                }
                 break;
+            }
             }
         } else {
             pr("; mul tcc__r%d,tcc__r%d\n", fr, r);
