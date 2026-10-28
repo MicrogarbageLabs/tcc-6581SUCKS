@@ -1962,6 +1962,21 @@ static void gen_cast(CType *type)
                     /* machine independent conversion */
                     gv(RC_INT);
                     /* generate high word */
+#ifdef TCC_TARGET_816
+                    if (sbt == VT_PTR || sbt == VT_FUNC) {
+                        /* a pointer's register holds the address in tcc__rN
+                           and the bank in tcc__rNh: the bank is the high
+                           word, not a sign extension of the low one (which
+                           sent (u32)&var for anything at $2000 up to bank
+                           $00) */
+                        int r = vtop->r & VT_VALMASK;
+                        int r2 = get_reg(RC_INT);
+                        pr("; ptr to llong: the bank is the high word\n");
+                        pr("lda.b tcc__r%dh\nand.w #$00FF\nsta.b tcc__r%d\n", r, r2);
+                        vpushi(0);      /* the high word, as the branches below leave it */
+                        vtop->r = r2;
+                    } else
+#endif
                     if (sbt == (VT_INT | VT_UNSIGNED)) {
                         vpushi(0);
                         gv(RC_INT);
@@ -4944,7 +4959,12 @@ static void init_putv(CType *type, Section *sec, unsigned long c, int v, int exp
                 greloc(sec, vtop->sym, c, R_DATA_PTR);
             }
 #ifdef TCC_TARGET_816
-            *(short *) ptr |= (vtop->c.i & bit_mask) << bit_pos;
+            /* a pointer is 4 bytes: a plain address (u8 *)0xC80000 keeps
+               its bank; a symbol's goes through the relocation */
+            if (bt == VT_PTR && !(vtop->r & VT_SYM))
+                *(int *) ptr |= (vtop->c.i & bit_mask) << bit_pos;
+            else
+                *(short *) ptr |= (vtop->c.i & bit_mask) << bit_pos;
 #else
             *(int *) ptr |= (vtop->c.i & bit_mask) << bit_pos;
 #endif
