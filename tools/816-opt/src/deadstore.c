@@ -311,8 +311,20 @@ static void analyze(dynArray *file, flow_t *F)
 
         /* returns */
         if (is(l, "rtl") || is(l, "rts") || is(l, "rti")) {
+            const char *raw = file->arr[i];
             l->exit = 1;
-            l->exitset = ret_regs();
+            /* the compiler's mark says what the function returns
+               (816-gen.c gfunc_epilog); without one, all it might */
+            if (strstr(raw, "; retvoid"))
+                l->exitset = 0;
+            else if (strstr(raw, "; ret16"))
+                l->exitset = (regset) 1 << 0;                           /* r0 */
+            else if (strstr(raw, "; retptr"))
+                l->exitset = ((regset) 1 << 0) | ((regset) 1 << 1);     /* r0, r0h */
+            else if (strstr(raw, "; ret32"))
+                l->exitset = ((regset) 1 << 0) | ((regset) 1 << 2);     /* r0, r1 */
+            else
+                l->exitset = ret_regs();
             l->nsucc = 0;
             l->flow = 1;
             continue;

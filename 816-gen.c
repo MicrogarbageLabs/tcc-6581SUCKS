@@ -2611,7 +2611,25 @@ void gfunc_epilog(void)
            current_fn, k, current_fn, k, current_fn, k);
     pr("; add sp, #__%s_locals\n", current_fn);
     pr(".ifgr __%s_locals 0\ntsa\nclc\nadc #__%s_locals\ntas\n.endif\n", current_fn, current_fn);
-    pr("rtl\n");
+    {
+        /* what comes back, for 816-opt's liveness (a trailing comment, which
+           it keeps): void nothing, 16 bits r0, a pointer r0 and its bank
+           r0h, 32 bits r0 and r1, a float f0; a struct (by a hidden
+           pointer) left as it was, everything */
+        int bt = func_vt.t & VT_BTYPE;
+        const char *ret = "";
+        if (bt == VT_VOID)
+            ret = " ; retvoid";
+        else if (is_float(func_vt.t))
+            ret = " ; retf";
+        else if (bt == VT_LLONG)
+            ret = " ; ret32";
+        else if (bt == VT_PTR || bt == VT_FUNC)
+            ret = " ; retptr";
+        else if (bt != VT_STRUCT)
+            ret = " ; ret16";
+        pr("rtl%s\n", ret);
+    }
 
     pr(".ENDS\n");
     section_closed = 1;
