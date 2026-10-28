@@ -141,9 +141,20 @@ config.mak:
 	@echo Running configure ...
 	@./configure
 
+# the compiler tests: each tests/cases/*.c built and run on a 65816
+# emulator (tests/README.md); needs PVSnesLib 4.5 at $PVSNESLIB_HOME
+test: $(PROGS)
+	sh tests/run.sh
+
+# the emulator against Tom Harte's single-step tests (fetches a slice once)
+test-emu:
+	cd tests/emu && $(CC) -O2 -Wall -o sst_run sst_run.c emu816.c
+	cd tests/emu && python3 sst_fetch.py && ./sst_run sst/*.txt
+
 # clean
 clean:
 	rm -f $(PROGS) *.o lib/*.o *.a *.out
+	rm -rf tests/build
 
 distclean: clean
 	rm -rf config.h config.mak docs/html

@@ -12,3 +12,9 @@ backup/
 docs/html
 lib/libtcc1.o
 libtcc1.a
+
+# test outputs
+tests/emu/sst/
+tests/build/
+*.exe
+tests/emu/sst_run
