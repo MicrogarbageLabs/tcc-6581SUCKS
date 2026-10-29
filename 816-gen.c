@@ -558,12 +558,15 @@ static dp_stat_t *dp_find(Sym *s)
     return NULL;
 }
 
+static void yl_note_use(Sym *s);
+
 /* the dry run: a local used, or its address taken */
 void dp_note_use(Sym *s)
 {
     dp_stat_t *d = dp_find(s);
     if (d)
         d->weight += loop_depth == 0 ? 1 : loop_depth == 1 ? 8 : 32;
+    yl_note_use(s);
 }
 
 void dp_note_addr(Sym *s)
@@ -638,6 +641,8 @@ typedef struct {
     int cwrites;                /* writes to the counter besides the increment */
     int test_stores[4], ntest;  /* locals the test writes (before the counter is known) */
     int xok, xchosen;
+    Sym *us[8];                 /* locals used in it, and how often (a while loop's */
+    int uc[8], nu;              /* counter: the most used, when no increment names one) */
 } yl_t;
 static yl_t yl[YL_MAX];
 static int yl_n;                /* loops the dry run recorded */
@@ -765,7 +770,49 @@ static int text_uses_y(const char *p, const char *end)
     return 0;
 }
 
-/* a for loop begins, before its test */
+/* the dry run: a local used, counted in every loop open now */
+static void yl_note_use(Sym *s)
+{
+    int i, j, k;
+    for (i = 0; i < yl_sp; i++) {
+        if ((k = yl_stack[i]) < 0)
+            continue;
+        for (j = 0; j < yl[k].nu && yl[k].us[j] != s; j++)
+            ;
+        if (j < yl[k].nu)
+            yl[k].uc[j]++;
+        else if (j < 8) {
+            yl[k].us[j] = s;
+            yl[k].uc[j] = 1;
+            yl[k].nu++;
+        }
+    }
+}
+
+/* the dry run, at a loop's end with no counter named by an increment (a
+   while or do loop, or a for loop without one): its most used local still
+   in scope, a 2-byte automatic one used at least twice */
+static void yl_pick_hottest(int k)
+{
+    int j, best = -1, bc = 1;
+    for (j = 0; j < yl[k].nu; j++) {
+        Sym *s = yl[k].us[j];
+        int align;
+        if (yl[k].uc[j] <= bc || sym_find(s->v) != s || (s->r & (VT_VALMASK | VT_LVAL)) != (VT_LOCAL | VT_LVAL)
+            || is_float(s->type.t) || (s->type.t & VT_BTYPE) == VT_PTR || type_size(&s->type, &align) != 2)
+            continue;
+        best = j;
+        bc = yl[k].uc[j];
+    }
+    if (best < 0)
+        return;
+    yl[k].sym = yl[k].us[best];
+    yl[k].tok = yl[k].sym->v;
+    yl[k].two = 1;
+}
+
+/* a loop begins: a for loop before its test, a while loop before its test,
+   a do loop before its body */
 void yl_loop_begin(void)
 {
     if (dry_run) {
@@ -865,6 +912,8 @@ void yl_loop_end(void)
         int k = yl_stack[yl_sp];
         if (k < 0)
             return;
+        if (!yl[k].tok)
+            yl_pick_hottest(k);
         yl[k].end = ind;
         yl[k].ok = yl[k].tok && goto_seen == yl[k].gotos
                    && !text_uses_y((char *) cur_text_section->data + yl[k].start,

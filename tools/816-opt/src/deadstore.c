@@ -715,6 +715,35 @@ size_t forwardOperands(dynArray *file)
         if (gone[i] || a->kind != K_INSN || a->keep)
             continue;
 
+        /* while (n--) with n in Y (816-gen.c yl_*): the old value tested,
+             sty rA / tya / sta rB / clc / lda rA / adc.w #65535 / tay /
+             lda rB / bne L         ->  dey / cpy.w #65535 / bne L
+           (beq too): Z was old == 0, and is now new == $FFFF, the same;
+           rA and rB dead after */
+        if (is(a, "sty") && i + 8 < F.n && !a->x8 && !a->m8) {
+            int ra = stored_reg(a), rb = stored_reg(&F.L[i + 2]);
+            line_t *br = &F.L[i + 8];
+            size_t u;
+            int ok = ra >= 0 && rb >= 0 && ra != rb && is(&F.L[i + 1], "tya") && is(&F.L[i + 2], "sta")
+                     && is(&F.L[i + 3], "clc") && reg_operand(&F.L[i + 4], "lda") == ra && is(&F.L[i + 5], "adc")
+                     && !strcmp(F.L[i + 5].op, "#65535") && is(&F.L[i + 6], "tay")
+                     && reg_operand(&F.L[i + 7], "lda") == rb && (is(br, "bne") || is(br, "beq"))
+                     && !((F.out[i + 8] >> ra) & 1) && !((F.out[i + 8] >> rb) & 1);
+            for (u = i + 1; ok && u <= i + 8; u++)
+                if (gone[u] || F.L[u].labelled)
+                    ok = 0;
+            if (ok) {
+                replace_line(file, i, "dey");
+                replace_line(file, i + 1, "cpy.w #65535");
+                for (u = i + 2; u <= i + 7; u++)
+                    drop_line(file, u);
+                for (u = i; u <= i + 8; u++)
+                    gone[u] = 1;
+                done++;
+                continue;
+            }
+        }
+
         /* a load nothing reads: lda of a pseudo-register or slot (no side
            effect, unlike an I/O register) with A dead after and its N and Z
            unread */

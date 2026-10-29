@@ -4628,6 +4628,9 @@ static void block_impl(int *bsym, int *csym, int *case_sym, int *def_sym, int ca
     } else if (tok == TOK_WHILE) {
         next();
         loop_depth++;
+#ifdef TCC_TARGET_816
+        yl_loop_begin();                /* its most used local in Y, if chosen */
+#endif
         d = ind;
         skip('(');
         gexpr(NULL);
@@ -4638,6 +4641,9 @@ static void block_impl(int *bsym, int *csym, int *case_sym, int *def_sym, int ca
         gjmp_addr(d);
         gsym(a);
         gsym_addr(b, d);
+#ifdef TCC_TARGET_816
+        yl_loop_end();
+#endif
         loop_depth--;
     } else if (tok == '{') {
         Sym *llabel;
@@ -4848,6 +4854,9 @@ static void block_impl(int *bsym, int *csym, int *case_sym, int *def_sym, int ca
         loop_depth++;
         a = 0;
         b = 0;
+#ifdef TCC_TARGET_816
+        yl_loop_begin();
+#endif
         d = ind;
         block(&a, &b, case_sym, def_sym, case_reg, 0);
         skip(TOK_WHILE);
@@ -4858,6 +4867,9 @@ static void block_impl(int *bsym, int *csym, int *case_sym, int *def_sym, int ca
         gsym_addr(c, d);
         skip(')');
         gsym(a);
+#ifdef TCC_TARGET_816
+        yl_loop_end();
+#endif
         skip(';');
         loop_depth--;
     } else if (tok == TOK_SWITCH) {
