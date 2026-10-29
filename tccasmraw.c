@@ -1,13 +1,11 @@
-static void asmraw_instr(void)
+/* __asmraw__'s text, read from the source as it is, the '(' just
+   tokenised: into cstr, trimmed, with its NUL; the token after the ')' is
+   tokenised */
+static void asmraw_scan(CString *out)
 {
-    CString cstr;
     int has_quote = 0;
     int paren_depth = 0; /* tracks nested '(' in the unquoted case */
-
-    next();
-    if (tok != '(') {
-        expect("(");
-    }
+#define cstr (*out)
 
     /* IMPORTANT: next_nomacro1() only updates file->buf_ptr internally
        (via its local cursor 'p'); it never touches the global 'ch'
@@ -76,18 +74,6 @@ static void asmraw_instr(void)
         p[--len] = '\0';
     }
 
-    /* Emit the collected raw assembly text as-is.
-       NOTE: pr()'s internal buffer (char line[MAXLEN], 512 bytes) would
-       silently truncate long __asmraw__ blocks. Since p is already a
-       complete, fully-formed string, write it directly instead of
-       routing it through pr()'s fixed-size vsnprintf buffer. */
-    if (len > 0) {
-        s(p);
-        s("\n");
-    }
-
-    cstr_free(&cstr);
-
     /* Consume the closing quote, if any */
     if (has_quote && ch == '"') {
         inp();
@@ -104,4 +90,42 @@ static void asmraw_instr(void)
         inp();
     }
     next();
+#undef cstr
+}
+
+/* the text, as it is. NOTE: pr()'s internal buffer (char line[MAXLEN],
+   512 bytes) would silently truncate long __asmraw__ blocks, so it is
+   written directly */
+static void asmraw_emit(const char *p)
+{
+    if (*p) {
+        s("; asm {\n");          /* 816-opt leaves it as written */
+        s((char *) p);
+        s("\n; asm }\n");
+    }
+}
+
+static void asmraw_instr(void)
+{
+    CString cstr;
+
+    next();
+    if (tok != '(') {
+        expect("(");
+    }
+    if (macro_ptr) {
+        /* from saved tokens (816: each function is compiled from them,
+           twice), where the text is one string, read from the source when
+           they were saved (gen_function); or a macro's quoted form */
+        next();
+        if (tok != TOK_STR)
+            expect("__asmraw__'s text");
+        asmraw_emit((char *) tokc.cstr->data);
+        next();
+        skip(')');
+        return;
+    }
+    asmraw_scan(&cstr);
+    asmraw_emit((char *) cstr.data);
+    cstr_free(&cstr);
 }

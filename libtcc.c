@@ -243,6 +243,7 @@ static int tcc_assemble(TCCState *s1, int do_preprocess);
 
 static void asm_instr(void);
 static void asm_global_instr(void);
+static void asmraw_scan(CString *out);
 
 /********************************************************/
 /* libtcc.c */

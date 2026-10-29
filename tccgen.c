@@ -5886,6 +5886,24 @@ static void gen_function(Sym *sym)
             if (t == TOK_EOF || t < 0)
                 error("unexpected end of file in a function");
             tok_str_add_tok(&body);
+            if ((t == TOK_ASMRAW1 || t == TOK_ASMRAW2 || t == TOK_ASMRAW3) && !macro_ptr) {
+                /* __asmraw__ reads its text from the source as it is: read
+                   it now, while the source is here, and keep it as one
+                   string for the passes (asmraw_instr) */
+                CString raw;
+                CValue cv;
+                next();
+                if (tok != '(')
+                    expect("(");
+                cstr_new(&raw);
+                asmraw_scan(&raw);
+                tok_str_add(&body, '(');
+                cv.cstr = &raw;
+                tok_str_add2(&body, TOK_STR, &cv);
+                tok_str_add(&body, ')');
+                cstr_free(&raw);
+                continue;
+            }
             next();
             if (t == '{')
                 level++;
