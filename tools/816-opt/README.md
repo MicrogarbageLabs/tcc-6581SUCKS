@@ -42,6 +42,12 @@ a few lines of straight code. Lines 816-tcc marks `; volatile` are never dropped
   - `while (n--)` as `dey / cpy.w #$ffff`.
   - `[tcc__rN]` read as `[tcc__lK]` when `rN` is a copy of a slot pointer.
 
+**Inline assembly is left alone.** 816-tcc puts every `asm` and `__asmraw__` block between
+`; asm {` and `; asm }` lines. `tidyFile` lifts each block out as written and leaves one line,
+`.asmblock_N:`, in its place. To `deadstore.c` that line is a directive that reads every register.
+To the pattern passes it's control flow, because it ends in `:`. No pass moves code across it or
+changes what's inside, and the block goes back unchanged when the file is written.
+
 A rule may replace one line with two. `compact()` splits such a line before the next pass, which
 would otherwise see only its first instruction.
 

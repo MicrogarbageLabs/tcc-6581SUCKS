@@ -37,6 +37,7 @@
 int verbosity();
 void PrintVersion(void);
 dynArray tidyFile(char *filename);
+const char *asm_block(const char *line);
 dynArray storeBss(dynArray file);
 dynArray optimizeAsm(dynArray file, dynArray bss, size_t verbose);
 

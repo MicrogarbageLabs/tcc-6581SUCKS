@@ -238,6 +238,11 @@ static void analyze(dynArray *file, flow_t *F)
 
         if (c[0] == 0)
             continue;
+        if (!strncmp(c, ".asmblock_", 10)) {
+            l->kind = K_DIRECTIVE;      /* an asm block (optimizer.c): it may read anything */
+            l->use = ALL;
+            continue;
+        }
         if (is_named_label(c)) {
             l->kind = K_LABEL;
             continue;

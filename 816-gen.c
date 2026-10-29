@@ -643,6 +643,7 @@ typedef struct {
     int xok, xchosen;
     Sym *us[8];                 /* locals used in it, and how often (a while loop's */
     int uc[8], nu;              /* counter: the most used, when no increment names one) */
+    int asm_x, asm_y;           /* an asm statement in it clobbers X / Y */
 } yl_t;
 static yl_t yl[YL_MAX];
 static int yl_n;                /* loops the dry run recorded */
@@ -727,6 +728,18 @@ static void yl_note_store(SValue *sv)
         yl[k].test_stores[yl[k].ntest++] = sv->c.ul;
     else
         yl[k].cwrites++;        /* too many to tell */
+}
+
+/* the dry run: an asm statement clobbers X and/or Y: no loop open now
+   keeps its index or counter there */
+void yl_asm_clobbers(int x, int y)
+{
+    int i, k;
+    for (i = 0; i < yl_sp; i++)
+        if ((k = yl_stack[i]) >= 0) {
+            yl[k].asm_x |= x;
+            yl[k].asm_y |= y;
+        }
 }
 
 /* the real pass: X steps with the counter, after the increment's ldy */
@@ -915,10 +928,10 @@ void yl_loop_end(void)
         if (!yl[k].tok)
             yl_pick_hottest(k);
         yl[k].end = ind;
-        yl[k].ok = yl[k].tok && goto_seen == yl[k].gotos
+        yl[k].ok = yl[k].tok && goto_seen == yl[k].gotos && !yl[k].asm_y
                    && !text_uses_y((char *) cur_text_section->data + yl[k].start,
                                    (char *) cur_text_section->data + yl[k].end);
-        yl[k].xok = yl[k].ok && yl[k].scale && yl[k].step && !yl[k].has_child && !yl[k].cwrites
+        yl[k].xok = yl[k].ok && yl[k].scale && yl[k].step && !yl[k].has_child && !yl[k].cwrites && !yl[k].asm_x
                     && !text_writes_x((char *) cur_text_section->data + yl[k].start,
                                       (char *) cur_text_section->data + yl[k].end);
         if (yl_norder < YL_MAX)

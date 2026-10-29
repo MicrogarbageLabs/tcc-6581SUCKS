@@ -134,7 +134,8 @@ int main(int argc, char **argv)
     }
     for (size_t i = 0; i < optAsm.used; i++)
     {
-        fprintf(fp, "%s\n", optAsm.arr[i]);
+        const char *blk = asm_block(optAsm.arr[i]);     /* an asm block, as written */
+        fprintf(fp, "%s\n", blk ? blk : optAsm.arr[i]);
     }
 	fclose(fp);
 

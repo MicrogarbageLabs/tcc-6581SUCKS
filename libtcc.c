@@ -351,6 +351,10 @@ static inline int toup(int c)
 #endif
 
 #include "tccasm.c"
+#elif defined(TCC_TARGET_816)
+/* GCC-style asm() with operands, the 816-tcc fork's (tccasmraw.c) */
+static void asm_instr(void) { asm816_instr(); }
+static void asm_global_instr(void) { asm816_global_instr(); }
 #else
 static void asm_instr(void)
 {

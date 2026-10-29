@@ -105,12 +105,31 @@ int isControl(const char *a)
  * @param fileoptim The file to optimize.
  * @return A structure (dynArray).
  */
+/* asm blocks (816-tcc fork): the text between "; asm {" and "; asm }",
+   lifted out as written and put back by asm_block() when the file is
+   written; in between, one line ".asmblock_N:" stands for each, which
+   every pass treats as a barrier (a directive that reads every register,
+   and a line ending in ':') */
+static char **asm_blocks;
+static size_t asm_nblocks;
+
+const char *asm_block(const char *line)
+{
+    size_t k;
+    if (strncmp(line, ".asmblock_", 10))
+        return NULL;
+    k = (size_t) strtoul(line + 10, NULL, 10);
+    return k < asm_nblocks ? asm_blocks[k] : NULL;
+}
+
 dynArray tidyFile(char *filename)
 {
     char buf[MAXLEN_LINE];
     size_t nptrs = 10;
     size_t len;
     dynArray file;
+    char *block = NULL;         /* inside an asm block: its text so far */
+    size_t blen = 0;
     file.used = 0;
 
     FILE *fp = fopen(filename, "r");
@@ -125,6 +144,35 @@ dynArray tidyFile(char *filename)
 
     while (fgets(buf, MAXLEN_LINE, fp)) {
         buf[(len = strcspn(buf, "\n"))] = 0;
+        if (len && buf[len - 1] == '\r')
+            buf[--len] = 0;
+
+        if (block || !strcmp(trimWhiteSpace(buf), "; asm {")) {
+            int end = block && !strcmp(trimWhiteSpace(buf), "; asm }");
+            size_t add = strlen(buf) + 1;
+            char *t = realloc(block, blen + add + 1);
+            if (!t)
+                fatal("realloc-asm");
+            block = t;
+            if (blen)
+                block[blen++] = '\n';
+            memcpy(block + blen, buf, add);
+            blen += add - 1;
+            if (!end)
+                continue;
+            /* the block ends: keep it, and a line in its place */
+            {
+                char **a = realloc(asm_blocks, (asm_nblocks + 1) * sizeof *a);
+                if (!a)
+                    fatal("realloc-asm");
+                asm_blocks = a;
+                asm_blocks[asm_nblocks] = block;
+                block = NULL;
+                blen = 0;
+                snprintf(buf, sizeof buf, ".asmblock_%lu:", (unsigned long) asm_nblocks++);
+                len = strlen(buf);
+            }
+        }
 
         if (!startWith(buf, ASM_COMMENT)) {
             if (file.used == nptrs) {
