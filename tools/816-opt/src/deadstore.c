@@ -410,13 +410,49 @@ static void release(flow_t *F)
 }
 
 /* rebuild the file: drop the lines marked NULL in arr */
+/* the dropped lines out, and a replacement of several lines ("tya\nasl a")
+   split into its lines, so the next pass sees each */
 static void compact(dynArray *file)
 {
-    size_t i, w = 0;
+    size_t i, w = 0, extra = 0;
     for (i = 0; i < file->used; i++)
         if (file->arr[i])
             file->arr[w++] = file->arr[i];
     file->used = w;
+    for (i = 0; i < file->used; i++) {
+        const char *p;
+        for (p = file->arr[i]; (p = strchr(p, '\n')) != NULL; p++)
+            extra++;
+    }
+    if (extra) {
+        char **out = malloc((file->used + extra) * sizeof *out);
+        size_t o = 0;
+        if (!out)
+            fatal("malloc-deadstore");
+        for (i = 0; i < file->used; i++) {
+            char *s = file->arr[i], *nl;
+            while ((nl = strchr(s, '\n')) != NULL) {
+                char *piece = malloc(nl - s + 1);
+                if (!piece)
+                    fatal("malloc-deadstore");
+                memcpy(piece, s, nl - s);
+                piece[nl - s] = 0;
+                out[o++] = piece;
+                s = nl + 1;
+            }
+            {
+                char *last = malloc(strlen(s) + 1);
+                if (!last)
+                    fatal("malloc-deadstore");
+                strcpy(last, s);
+                out[o++] = last;
+            }
+            free(file->arr[i]);
+        }
+        free(file->arr);
+        file->arr = out;
+        file->used = o;
+    }
 }
 
 static void replace_line(dynArray *file, size_t i, const char *text)
@@ -591,6 +627,55 @@ static int a_dead_after(flow_t *F, size_t i)
     return 0;
 }
 
+static int is_cond_branch(const line_t *l);
+
+/* A is dead from line j on: every path loads it anew (or returns, or calls:
+   a callee doesn't read the caller's A) before anything reads it; past
+   instructions that don't touch A, through jumps, both ways at a branch */
+static int a_dead_from(flow_t *F, size_t j, int depth)
+{
+    static const char *noa[] = {"ldx", "ldy", "stx", "sty", "stz", "inx", "dex", "iny", "dey", "cpx", "cpy", "txy",
+                                "tyx", "pea", "pei", "phx", "phy", "plx", "ply", "clc", "sec", "cli", "sei", "nop",
+                                "rep", "sep", NULL};
+    int steps = 0;
+    if (depth > 6)
+        return 0;
+    while (j < F->n && steps++ < 64) {
+        line_t *l = &F->L[j];
+        int k, quiet = 0;
+        if (l->kind == K_NONE || l->kind == K_LABEL) {
+            j++;
+            continue;
+        }
+        if (l->kind != K_INSN)
+            return 0;           /* a directive: conditional code */
+        if (a_overwritten(l) || is(l, "rtl") || is(l, "rts") || is(l, "jsr") || is(l, "jsl"))
+            return 1;
+        if ((is(l, "bra") || is(l, "brl") || is(l, "jmp")) && l->nsucc == 1 && !l->exit) {
+            j = (size_t) l->succ[0];
+            if (++depth > 6)
+                return 0;
+            continue;
+        }
+        if (is_cond_branch(l)) {
+            if (l->nsucc != 2 || !a_dead_from(F, (size_t) l->succ[1], depth + 1))
+                return 0;
+            j++;
+            continue;
+        }
+        for (k = 0; noa[k]; k++)
+            if (is(l, noa[k]))
+                quiet = 1;
+        if ((is(l, "asl") || is(l, "lsr") || is(l, "rol") || is(l, "ror") || is(l, "inc") || is(l, "dec")) && l->op[0]
+            && strcmp(l->op, "a"))
+            quiet = 1;          /* on memory: A untouched */
+        if (!quiet || l->flow)
+            return 0;
+        j++;
+    }
+    return 0;
+}
+
 #define WINDOW 16
 
 size_t forwardOperands(dynArray *file)
@@ -614,6 +699,84 @@ size_t forwardOperands(dynArray *file)
 
         if (gone[i] || a->kind != K_INSN || a->keep)
             continue;
+
+        /* a loop's counter in Y (816-gen.c yl_*):
+             sty rN / lda rN        ->  tya          (rN dead after)
+             tya / cmp X            ->  cpy X        (A dead after; X immediate,
+                                                      direct page or absolute)
+             tya / inc a / tay      ->  iny          (dec: dey; A dead after) */
+        r = stored_reg(a);
+        if (r >= 0 && is(a, "sty") && !a->x8 && !gone[i + 1] && reg_operand(&F.L[i + 1], "lda") == r
+            && !F.L[i + 1].keep && !F.L[i + 1].labelled && !F.L[i + 1].m8 && !(F.out[i + 1] & ((regset) 1 << r))) {
+            replace_line(file, i, "tya");
+            drop_line(file, i + 1);
+            gone[i] = gone[i + 1] = 1;
+            done++;
+            continue;
+        }
+        if (r >= 0 && is(a, "sty") && !a->x8 && i + 2 < F.n && !gone[i + 1] && !gone[i + 2]
+            && (reg_operand(&F.L[i + 1], "inc") == r || reg_operand(&F.L[i + 1], "dec") == r)
+            && reg_operand(&F.L[i + 2], "ldy") == r && !F.L[i + 1].labelled && !F.L[i + 2].labelled
+            && !F.L[i + 2].keep && !(F.out[i + 2] & ((regset) 1 << r))) {
+            /* sty rN / inc rN / ldy rN  ->  iny (dec: dey) */
+            replace_line(file, i, is(&F.L[i + 1], "inc") ? "iny" : "dey");
+            drop_line(file, i + 1);
+            drop_line(file, i + 2);
+            gone[i] = gone[i + 1] = gone[i + 2] = 1;
+            done++;
+            continue;
+        }
+        /* sty rN / asl rN  ->  tya / asl a / sta rN (stx: txa; lsr rol ror
+           inc dec too), and sta rN / asl rN  ->  asl a / sta rN, when A is
+           dead after: a shift in A, and the value parked where tax / tay can
+           take it */
+        if (r >= 0 && (is(a, "sty") || is(a, "stx") || is(a, "sta")) && !a->x8 && !a->m8 && i + 1 < F.n
+            && !gone[i + 1]) {
+            line_t *m = &F.L[i + 1];
+            static const char *rmw[] = {"asl", "lsr", "rol", "ror", "inc", "dec", NULL};
+            int k, hit = 0;
+            for (k = 0; rmw[k]; k++)
+                if (reg_operand(m, rmw[k]) == r)
+                    hit = 1;
+            if (hit && !m->labelled && !m->keep && a_dead_from(&F, i + 2, 0)) {
+                char b2[32], b3[32];
+                snprintf(b2, sizeof b2, "%s a", m->mn);
+                snprintf(b3, sizeof b3, "sta.b tcc__r%d", r / 2);
+                if (is(a, "sta")) {
+                    replace_line(file, i, b2);
+                    replace_line(file, i + 1, b3);
+                } else {
+                    char b1[64];
+                    snprintf(b1, sizeof b1, "%s\n%s", is(a, "sty") ? "tya" : "txa", b2);
+                    replace_line(file, i, b1);
+                    replace_line(file, i + 1, b3);
+                }
+                gone[i] = gone[i + 1] = 1;
+                done++;
+                continue;
+            }
+        }
+        if (is(a, "tya") && !a->m8 && !a->x8 && i + 1 < F.n && !gone[i + 1]) {
+            line_t *m = &F.L[i + 1];
+            if (is(m, "cmp") && !m->labelled && !m->keep && !m->vol && m->op[0] && !strchr(m->op, ',')
+                && !strchr(m->op, '[') && !strchr(m->op, '(') && strncmp(m->rest, ".l", 2) && a_dead_from(&F, i + 2, 0)) {
+                snprintf(buf, sizeof buf, "cpy%s", m->rest);
+                replace_line(file, i + 1, buf);
+                drop_line(file, i);
+                gone[i] = gone[i + 1] = 1;
+                done++;
+                continue;
+            }
+            if (i + 2 < F.n && !gone[i + 2] && (is(m, "inc") || is(m, "dec")) && !strcmp(m->op, "a") && !m->labelled
+                && is(&F.L[i + 2], "tay") && !F.L[i + 2].labelled && a_dead_from(&F, i + 3, 0)) {
+                replace_line(file, i, is(m, "inc") ? "iny" : "dey");
+                drop_line(file, i + 1);
+                drop_line(file, i + 2);
+                gone[i] = gone[i + 1] = gone[i + 2] = 1;
+                done++;
+                continue;
+            }
+        }
 
         /* lda M / inc a / sta M  ->  inc M (dec too), M direct page or
            absolute, when A is dead after: the same N and Z, carry untouched */
@@ -649,7 +812,11 @@ size_t forwardOperands(dynArray *file)
         if (is(a, "lda") && plain_operand(a) && !a->m8 && !a->vol && i + 2 < F.n) {
             line_t *s = &F.L[i + 1];
             int rs = stored_reg(s);
-            if (rs >= 0 && is(s, "sta") && !s->keep && !gone[i + 1] && sets_a_fresh(&F.L[i + 2]) && !F.L[i + 2].labelled) {
+            size_t f = i + 2;
+            while (f < F.n && (is(&F.L[f], "clc") || is(&F.L[f], "sec")) && !F.L[f].labelled)
+                f++;            /* the carry set up for the use: A untouched */
+            if (rs >= 0 && is(s, "sta") && !s->keep && !gone[i + 1] && f < F.n && sets_a_fresh(&F.L[f])
+                && !F.L[f].labelled) {
                 int sr = stack_relative(a);
                 for (j = i + 2; j < F.n && j < i + 2 + WINDOW; j++) {
                     line_t *t = &F.L[j];
@@ -1001,7 +1168,7 @@ size_t knownRegs(dynArray *file)
 
     for (i = 0; i < F.n; i++) {
         line_t *l = &F.L[i];
-        int have;
+        int have, kx, ka, ky;
         if (l->kind != K_INSN || l->keep || l->labelled || l->vol || !trackable(l))
             continue;
         if (is(l, "lda"))
@@ -1015,6 +1182,57 @@ size_t knownRegs(dynArray *file)
         if (have >= 0 && !strcmp(T.keys[have], l->rest) && !nz_needed_after(&F, i)) {
             drop_line(file, i);
             done++;
+            continue;
+        }
+        /* another register holds it: a transfer (2 cycles, the same N and Z),
+           with both registers 16 bits */
+        if (l->m8 || l->x8)
+            continue;
+        ka = in[i].a >= 0 && !strcmp(T.keys[in[i].a], l->rest);
+        kx = in[i].x >= 0 && !strcmp(T.keys[in[i].x], l->rest);
+        ky = in[i].y >= 0 && !strcmp(T.keys[in[i].y], l->rest);
+        {
+            const char *t = NULL;
+            if (is(l, "lda"))
+                t = kx ? "txa" : ky ? "tya" : NULL;
+            else if (is(l, "ldx"))
+                t = ka ? "tax" : ky ? "tyx" : NULL;
+            else if (is(l, "ldy"))
+                t = ka ? "tay" : kx ? "txy" : NULL;
+            if (t) {
+                replace_line(file, i, t);
+                done++;
+                continue;
+            }
+        }
+        /* lda.b rA / adc.b rB (and ora eor, all commutative) with rB in X or Y
+           and both dead after: the other way round, so the load can become a
+           transfer next time */
+        if (is(l, "lda") && i + 1 < F.n && !l->labelled && reg_operand(l, "lda") >= 0) {
+            line_t *m = &F.L[i + 1];
+            int ra = reg_operand(l, "lda"), rb = -1;
+            static const char *comm[] = {"adc", "and", "ora", "eor", NULL};
+            int k;
+            for (k = 0; comm[k]; k++)
+                if (reg_operand(m, comm[k]) >= 0)
+                    rb = reg_operand(m, comm[k]);
+            if (rb >= 0 && rb != ra && !m->labelled && !m->keep && !m->m8
+                && !((F.out[i + 1] >> ra) & 1) && !((F.out[i + 1] >> rb) & 1)) {
+                char want[64];
+                snprintf(want, sizeof want, ".b tcc__r%d", rb / 2);
+                if ((rb & 1) == 0 && (ra & 1) == 0
+                    && ((in[i].x >= 0 && !strcmp(T.keys[in[i].x], want))
+                        || (in[i].y >= 0 && !strcmp(T.keys[in[i].y], want)))) {
+                    char b1[64], b2[64];
+                    snprintf(b1, sizeof b1, "lda.b tcc__r%d", rb / 2);
+                    snprintf(b2, sizeof b2, "%s.b tcc__r%d", m->mn, ra / 2);
+                    replace_line(file, i, b1);
+                    replace_line(file, i + 1, b2);
+                    done++;
+                    i++;
+                    continue;
+                }
+            }
         }
     }
 
@@ -1096,16 +1314,30 @@ static int a_only(const line_t *l)
     return 0;
 }
 
-/* the block starting at s (an lda): its end, and the register it makes,
-   or -1 */
+/* what the last block_at began from: 0 memory, 'x' or 'y' (a loop's
+   counter in Y: sty.b rK / tya, the register's value parked in rK too) */
+static int block_src;
+
+/* the block starting at s (an lda, or sty.b rK / tya, stx.b rK / txa): its
+   end, and the register it makes, or -1 */
 static int block_at(flow_t *F, size_t s, size_t *end, int *reg)
 {
-    size_t j, last = 0;
+    size_t j, last = 0, first = s + 1;
     int r = -1;
     line_t *l = &F->L[s];
-    if (!is(l, "lda") || l->keep || l->labelled || l->m8 || l->vol || !plain_operand(l))
+    block_src = 0;
+    if ((is(l, "sty") || is(l, "stx")) && !l->keep && !l->labelled && !l->x8 && !l->m8 && s + 1 < F->n) {
+        int b = stored_reg(l);
+        line_t *t = &F->L[s + 1];
+        if (b < 0 || b >= 32 || (b & 1) || t->labelled || !is(t, is(l, "sty") ? "tya" : "txa"))
+            return -1;
+        r = b;
+        last = s;
+        first = s + 2;
+        block_src = is(l, "sty") ? 'y' : 'x';
+    } else if (!is(l, "lda") || l->keep || l->labelled || l->m8 || l->vol || !plain_operand(l))
         return -1;
-    for (j = s + 1; j < F->n && j < s + 24; j++) {
+    for (j = first; j < F->n && j < s + 24; j++) {
         line_t *t = &F->L[j];
         int b;
         if (t->kind != K_INSN || t->labelled || t->keep || t->flow || t->m8 || t->vol)
@@ -1123,7 +1355,7 @@ static int block_at(flow_t *F, size_t s, size_t *end, int *reg)
             continue;
         break;
     }
-    if (r < 0 || !last)
+    if (r < 0 || last <= s + (block_src ? 1 : 0))
         return -1;
     *end = last;
     *reg = r;
@@ -1234,9 +1466,10 @@ size_t reuseBlocks(dynArray *file)
 
     for (i = 0; i < F.n; i++) {
         size_t e1, s2, e2, len, k, j;
-        int ra, rb, ok, sr;
+        int ra, rb, ok, sr, src;
         if (gone[i] || block_at(&F, i, &e1, &ra) < 0)
             continue;
+        src = block_src;
         len = e1 - i + 1;
         sr = 0;
         for (k = i; k <= e1; k++)
@@ -1275,6 +1508,13 @@ size_t reuseBlocks(dynArray *file)
                     if (sr && stack_op(m))
                         ok = 0;
                     if (is(m, "sep") || is(m, "rep") || m->flow || m->labelled || m->kind != K_INSN)
+                        ok = 0;
+                    /* the source register unchanged */
+                    if (src == 'y' && (is(m, "ldy") || is(m, "iny") || is(m, "dey") || is(m, "tay") || is(m, "ply")
+                                       || is(m, "txy")))
+                        ok = 0;
+                    if (src == 'x' && (is(m, "ldx") || is(m, "inx") || is(m, "dex") || is(m, "tax") || is(m, "plx")
+                                       || is(m, "tyx")))
                         ok = 0;
                 }
                 /* after: A and the flags the second block left aren't needed */

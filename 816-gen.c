@@ -515,11 +515,14 @@ static dp_stat_t *dp_stat;
 static int dp_nstat, dp_capstat;
 
 /* before the dry run */
+static void yl_reset(void);
+
 void dp_dry_begin(void)
 {
     dp_nstat = 0;
     dp_decls = 0;
     dp_ncand = 0;
+    yl_reset();
 }
 
 /* the dry run: an automatic local declared */
@@ -564,6 +567,8 @@ void dp_note_addr(Sym *s)
 }
 
 /* between the passes: the heaviest DP_MAX, 16 at least */
+static void yl_choose(void);
+
 void dp_choose(void)
 {
     int k, i;
@@ -583,6 +588,185 @@ void dp_choose(void)
         dp_stat[best].weight = 0;
     }
     dp_decls = 0;
+    yl_choose();
+}
+
+/* A for loop's counter in Y. The dry run records each for loop (by order,
+   the same in both passes): its counter (the local its increment steps:
+   i++, ++i, i--, --i, i += n, i -= n) and whether its code, test to exit,
+   is free of Y (no Y instruction, no ,y, no call), of gotos and of labels.
+   Between the passes the innermost such loops whose counter is a 2-byte
+   automatic local, address never taken, are chosen (an outer loop only
+   when no loop inside it is). The real pass loads a chosen loop's counter
+   into Y before its test; inside, a read is sty, a write ldy; at the exit
+   (where the test and every break meet) Y goes back to the counter's home.
+   A return inside needs nothing: the counter dies with the function. */
+#define YL_MAX 256
+typedef struct {
+    int tok;                    /* the counter's name */
+    Sym *sym;                   /* ... in the dry run */
+    int start, end;             /* its text in the dry run */
+    int parent, ok, gotos, chosen, child_chosen;
+    int two;                    /* the counter is 2 bytes (read while its symbol lives) */
+} yl_t;
+static yl_t yl[YL_MAX];
+static int yl_n;                /* loops the dry run recorded */
+static int yl_order[YL_MAX], yl_norder;   /* ... in the order they ended */
+static int yl_stack[64], yl_sp; /* the loops open now (dry run: indexes; real: active or not) */
+static int yl_count;            /* for loops met so far in the real pass */
+int goto_seen;                  /* gotos and labels parsed: a loop's count must not move */
+static int yl_active, yl_c;     /* a counter in Y now, and its home's offset */
+static SValue yl_home;
+
+void store(int r, SValue *sv);
+
+static void yl_reset(void)
+{
+    yl_n = 0;
+    yl_norder = 0;
+    yl_sp = 0;
+    yl_active = 0;
+}
+
+/* any use of Y in emitted text: an instruction, an index, or a call */
+static int text_uses_y(const char *p, const char *end)
+{
+    static const char *ops[] = {"ldy", "sty", "iny", "dey", "tay", "tya", "cpy", "phy", "ply", "txy", "tyx",
+                                "jsr", "jsl", "mvn", "mvp", "rti", "brk", "cop", NULL};
+    while (p < end) {
+        const char *e = memchr(p, '\n', end - p), *q;
+        size_t n;
+        int k;
+        if (!e)
+            e = end;
+        while (p < e && (*p == ' ' || *p == '\t'))
+            p++;
+        n = e - p;
+        if (n && *p != ';') {
+            for (k = 0; ops[k]; k++)
+                if (n >= 3 && !strncmp(p, ops[k], 3))
+                    return 1;
+            for (q = p; q + 1 < e && *q != ';'; q++)
+                if (q[0] == ',' && (q[1] == 'y' || q[1] == 'Y'))
+                    return 1;
+        }
+        p = e + 1;
+    }
+    return 0;
+}
+
+/* a for loop begins, before its test */
+void yl_loop_begin(void)
+{
+    if (dry_run) {
+        int k = yl_n < YL_MAX ? yl_n++ : -1;
+        if (k >= 0) {
+            memset(&yl[k], 0, sizeof yl[k]);
+            yl[k].start = ind;
+            yl[k].gotos = goto_seen;
+            yl[k].parent = yl_sp ? yl_stack[yl_sp - 1] : -1;
+        }
+        if (yl_sp < 64)
+            yl_stack[yl_sp++] = k;
+        return;
+    }
+    {
+        int k = yl_count++, on = 0;
+        if (k < yl_n && yl[k].chosen && !yl_active) {
+            Sym *s = sym_find(yl[k].tok);
+            if (s && (s->r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL)) {
+                int r;
+                yl_home.type = s->type;
+                yl_home.r = s->r;
+                yl_home.r2 = VT_CONST;
+                yl_home.c.ul = s->c;
+                yl_home.sym = NULL;
+                vset(&s->type, s->r, s->c);
+                r = gv(RC_INT);
+                pr("; the loop's counter in Y\nldy.b tcc__r%d\n", r);
+                vpop();
+                yl_active = 1;
+                yl_c = s->c;
+                on = 1;
+            }
+        }
+        if (yl_sp < 64)
+            yl_stack[yl_sp++] = on;
+    }
+}
+
+/* the dry run: the loop's increment, as tokens, names its counter */
+void yl_loop_inc(int *ids, int n)
+{
+    int k, t = 0;
+    Sym *s;
+    if (!dry_run || !yl_sp || (k = yl_stack[yl_sp - 1]) < 0)
+        return;
+    if (n >= 2 && ids[0] >= TOK_UIDENT && (ids[1] == TOK_INC || ids[1] == TOK_DEC) && (n == 2 || ids[2] == ')'))
+        t = ids[0];
+    else if (n >= 2 && (ids[0] == TOK_INC || ids[0] == TOK_DEC) && ids[1] >= TOK_UIDENT && (n == 2 || ids[2] == ')'))
+        t = ids[1];
+    else if (n >= 3 && ids[0] >= TOK_UIDENT && (ids[1] == TOK_A_ADD || ids[1] == TOK_A_SUB) && ids[2] == TOK_CINT
+             && (n == 3 || ids[3] == ')'))
+        t = ids[0];
+    if (!t || !(s = sym_find(t)) || (s->r & (VT_VALMASK | VT_LVAL)) != (VT_LOCAL | VT_LVAL))
+        return;
+    {
+        int align;
+        yl[k].two = type_size(&s->type, &align) == 2 && !is_float(s->type.t);
+    }
+    yl[k].tok = t;
+    yl[k].sym = s;
+}
+
+/* a for loop ends, after its exit */
+void yl_loop_end(void)
+{
+    if (!yl_sp)
+        return;
+    yl_sp--;
+    if (dry_run) {
+        int k = yl_stack[yl_sp];
+        if (k < 0)
+            return;
+        yl[k].end = ind;
+        yl[k].ok = yl[k].tok && goto_seen == yl[k].gotos
+                   && !text_uses_y((char *) cur_text_section->data + yl[k].start,
+                                   (char *) cur_text_section->data + yl[k].end);
+        if (yl_norder < YL_MAX)
+            yl_order[yl_norder++] = k;
+        return;
+    }
+    if (yl_stack[yl_sp]) {
+        /* Y back to the counter's home, on the way out */
+        int r = get_reg(RC_INT);
+        yl_active = 0;
+        pr("; the loop's counter back from Y\nsty.b tcc__r%d\n", r);
+        store(r, &yl_home);
+    }
+}
+
+/* between the passes: the loops whose counter goes in Y */
+static void yl_choose(void)
+{
+    int i, k, p;
+    for (i = 0; i < yl_norder; i++) {
+        dp_stat_t *d;
+        int align;
+        k = yl_order[i];
+        if (!yl[k].ok || yl[k].child_chosen)
+            continue;
+        d = dp_find(yl[k].sym);
+        (void) align;
+        if (!d || d->addr || !d->fits || !yl[k].two)
+            continue;
+        yl[k].chosen = 1;
+        for (p = yl[k].parent; p >= 0; p = yl[p].parent)
+            yl[p].child_chosen = 1;
+    }
+    yl_count = 0;
+    yl_sp = 0;
+    yl_active = 0;
 }
 
 /* the real pass: an automatic local declared; its slot, or -1 */
@@ -696,6 +880,11 @@ static void load_impl(int r, SValue *sv)
     if (ll_workaround)
         length = 4;
 
+    if (yl_active && (fr & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && sv->c.ul == (unsigned long) yl_c
+        && length == 2 && r < TREG_F0) {
+        pr("sty.b tcc__r%d\n", r);    /* the loop's counter, in Y */
+        return;
+    }
     int base = -1;
     v = fr & VT_VALMASK;
     if (is_idx(sv)) {
@@ -1075,6 +1264,11 @@ static void store_impl(int r, SValue *sv)
 
     pr("; store r 0x%x fr 0x%x ft 0x%x fc 0x%x\n", r, fr, ft, fc);
 
+    if (yl_active && (fr & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && sv->c.ul == (unsigned long) yl_c
+        && length == 2 && r < TREG_F0) {
+        pr("ldy.b tcc__r%d\n", r);    /* the loop's counter, in Y */
+        return;
+    }
     if (is_idx(sv) && (fr & VT_LVAL)) {     /* an indexed global's element */
         char *sy = get_sym_str(sv->sym);
         pr("ldx.b tcc__r%d\n", fr & VT_VALMASK);

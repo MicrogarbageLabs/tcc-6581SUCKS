@@ -3838,6 +3838,9 @@ tok_next:
         /* allow to take the address of a label */
         if (tok < TOK_UIDENT)
             expect("label identifier");
+#ifdef TCC_TARGET_816
+        goto_seen++;            /* &&label */
+#endif
         s = label_find(tok);
         if (!s) {
             s = label_push(&global_label_stack, tok, LABEL_FORWARD);
@@ -4706,6 +4709,9 @@ static void block(int *bsym, int *csym, int *case_sym, int *def_sym, int case_re
             vpop();
         }
         skip(';');
+#ifdef TCC_TARGET_816
+        yl_loop_begin();                /* its counter into Y, if the dry run chose it */
+#endif
         d = ind;
         c = ind;
         a = 0;
@@ -4725,7 +4731,7 @@ static void block(int *bsym, int *csym, int *case_sym, int *def_sym, int case_re
         if (tok != ')') {
             TokenString inc_str;
             ParseState saved;
-            int level = 0;
+            int level = 0, inc_ids[8], n_inc = 0;
             tok_str_new(&inc_str);
             while (level > 0 || tok != ')') {
                 if (tok < 0)
@@ -4734,9 +4740,13 @@ static void block(int *bsym, int *csym, int *case_sym, int *def_sym, int case_re
                     level++;
                 else if (tok == ')')
                     level--;
+                if (n_inc < 8)
+                    inc_ids[n_inc] = tok;
+                n_inc++;
                 tok_str_add_tok(&inc_str);
                 next();
             }
+            yl_loop_inc(inc_ids, n_inc < 8 ? n_inc : 8);
             tok_str_add_tok(&inc_str);      /* the ')' */
             tok_str_add(&inc_str, -1);
             tok_str_add(&inc_str, 0);
@@ -4762,6 +4772,7 @@ static void block(int *bsym, int *csym, int *case_sym, int *def_sym, int case_re
         gjmp_addr(d);
         gsym(a);
         gsym_addr(b, c);
+        yl_loop_end();                  /* the counter back from Y, at the exit */
 #else
         if (tok != ')') {
             e = gjmp(0);
@@ -4859,6 +4870,9 @@ static void block(int *bsym, int *csym, int *case_sym, int *def_sym, int case_re
         is_expr = 0;
         goto block_after_label;
     } else if (tok == TOK_GOTO) {
+#ifdef TCC_TARGET_816
+        goto_seen++;
+#endif
         next();
         if (tok == '*' && gnu_ext) {
             /* computed goto */
@@ -4898,6 +4912,9 @@ static void block(int *bsym, int *csym, int *case_sym, int *def_sym, int case_re
         b = is_label();
         if (b) {
             /* label case */
+#ifdef TCC_TARGET_816
+            goto_seen++;
+#endif
             s = label_find(b);
             if (s) {
                 if (s->r == LABEL_DEFINED)
