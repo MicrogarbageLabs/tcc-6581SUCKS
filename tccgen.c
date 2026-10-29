@@ -2706,6 +2706,16 @@ void vstore(void)
 void inc(int post, int c, int preserve_old_value)
 {
     test_lvalue();
+#ifdef TCC_TARGET_816
+    /* the dry run: a read and a write, two uses */
+    if (dry_run && (vtop->r & VT_VALMASK) == VT_LOCAL && vtop->sym)
+        dp_note_use(vtop->sym);
+#endif
+#ifdef TCC_TARGET_816
+    /* a direct page pointer's p++: the step waits for the sequence point */
+    if (post && preserve_old_value && dp_pend_post(c == TOK_INC ? 1 : -1))
+        return;
+#endif
     vdup(); /* save lvalue */
     if (post && preserve_old_value) {
         gv_dup(); /* duplicate value */
@@ -4449,6 +4459,11 @@ static void expr_eq(DiscardedExprContext *dctx)
         if (t == '=') {
             expr_eq(NULL);
         } else {
+#ifdef TCC_TARGET_816
+            /* the dry run: a read and a write, two uses */
+            if (dry_run && (vtop->r & VT_VALMASK) == VT_LOCAL && vtop->sym)
+                dp_note_use(vtop->sym);
+#endif
             vdup();
             expr_eq(NULL);
             gen_op(t & 0x7f);
@@ -4461,6 +4476,9 @@ static void gexpr(DiscardedExprContext *dctx)
 {
     while (1) {
         expr_eq(dctx);
+#ifdef TCC_TARGET_816
+        dp_pend_flush();
+#endif
         if (tok != ',')
             break;
         vpop();
@@ -4558,7 +4576,21 @@ static void label_or_decl(int l)
     decl(l);
 }
 
+static void block_impl(int *bsym, int *csym, int *case_sym, int *def_sym, int case_reg, int is_expr);
+
+/* a statement; on the 816 nothing deferred crosses its edges */
 static void block(int *bsym, int *csym, int *case_sym, int *def_sym, int case_reg, int is_expr)
+{
+#ifdef TCC_TARGET_816
+    dp_pend_flush();
+#endif
+    block_impl(bsym, csym, case_sym, def_sym, case_reg, is_expr);
+#ifdef TCC_TARGET_816
+    dp_pend_flush();
+#endif
+}
+
+static void block_impl(int *bsym, int *csym, int *case_sym, int *def_sym, int case_reg, int is_expr)
 {
     int a, b, c, d;
     Sym *s;

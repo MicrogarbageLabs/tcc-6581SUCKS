@@ -502,14 +502,17 @@ static int fc_fits(CType *t)
 #define DP_IS_SLOT(c) ((unsigned) (c) >= DP_SLOT && (unsigned) (c) < DP_SLOT + 2 * DP_MAX)
 int dry_run = 0;                /* compiling a function's dry run: measure, emit nothing that stays */
 int loop_depth = 0;             /* loops the parser is inside */
-static int dp_ncand;            /* slots chosen for the real pass */
+static int dp_ncand;            /* locals chosen for the real pass */
 static int dp_chosen[DP_MAX];   /* their declarations, by order */
-static int dp_used[DP_MAX];     /* a declaration got the slot */
+static int dp_cslot[DP_MAX];    /* ... the first slot each has */
+static int dp_nslots;           /* slots handed out (a long pointer takes two) */
+static int dp_used[DP_MAX];     /* by slot: a declaration got it */
 static int dp_decls;            /* automatic locals declared so far in this pass */
 
 typedef struct {
     Sym *sym;
     int fits, weight, addr;
+    int ptr;                    /* a long pointer: two slots, lK and lK+1 ([tcc__lK] reads it) */
 } dp_stat_t;
 static dp_stat_t *dp_stat;
 static int dp_nstat, dp_capstat;
@@ -517,8 +520,11 @@ static int dp_nstat, dp_capstat;
 /* before the dry run */
 static void yl_reset(void);
 
+static int dp_npend;
+
 void dp_dry_begin(void)
 {
+    dp_npend = 0;
     dp_nstat = 0;
     dp_decls = 0;
     dp_ncand = 0;
@@ -535,7 +541,8 @@ void dp_note_decl(Sym *s, CType *type)
             error("out of memory");
     }
     dp_stat[dp_nstat].sym = s;
-    dp_stat[dp_nstat].fits = fc_fits(type) && !(type->t & VT_VOLATILE);
+    dp_stat[dp_nstat].ptr = (type->t & VT_BTYPE) == VT_PTR && !(type->t & (VT_ARRAY | VT_VOLATILE));
+    dp_stat[dp_nstat].fits = (fc_fits(type) || dp_stat[dp_nstat].ptr) && !(type->t & VT_VOLATILE);
     dp_stat[dp_nstat].weight = 0;
     dp_stat[dp_nstat].addr = 0;
     dp_nstat++;
@@ -573,18 +580,23 @@ void dp_choose(void)
 {
     int k, i;
     dp_ncand = 0;
-    for (k = 0; k < DP_MAX; k++) {
+    dp_nslots = 0;
+    for (k = 0; k < DP_MAX; k++)
+        dp_used[k] = 0;
+    while (dp_nslots < DP_MAX) {
         int best = -1, bw = 15;
         for (i = 0; i < dp_nstat; i++)
-            if (dp_stat[i].fits && !dp_stat[i].addr && dp_stat[i].weight > bw) {
+            if (dp_stat[i].fits && !dp_stat[i].addr && dp_stat[i].weight > bw
+                && dp_nslots + (dp_stat[i].ptr ? 2 : 1) <= DP_MAX) {
                 bw = dp_stat[i].weight;
                 best = i;
             }
         if (best < 0)
             break;
         dp_chosen[dp_ncand] = best;
-        dp_used[dp_ncand] = 0;
+        dp_cslot[dp_ncand] = dp_nslots;
         dp_ncand++;
+        dp_nslots += dp_stat[best].ptr ? 2 : 1;
         dp_stat[best].weight = 0;
     }
     dp_decls = 0;
@@ -898,14 +910,91 @@ static void yl_choose(void)
     yl_active = 0;
 }
 
+/* A post-increment of a long pointer in direct page slots (p++ whose
+   value is used), deferred to the next sequence point: the old value is
+   then p itself, so *p++ reads through [tcc__lK] (816-opt forwards the
+   copy) and the increment is one add on the slot, not a copy, an add and
+   a copy back. The value inc() leaves is p's lvalue tagged r2 = TREG_PEND.
+   dp_pend_flush, at every statement's start and end (block), after an
+   expression (gexpr), before any branch (gtst) and before the same
+   pointer is stepped again, loads each tagged value still on the stack
+   into a register, then does the adds (php/plp around them when a
+   compare's flags wait at vtop). */
+#define TREG_PEND 7             /* r2 of a deferred p++'s value */
+void load(int r, SValue *sv);
+static struct { int k, delta; } dp_pend[4];
+static int dp_npend;
+
+static int dp_ptr_slot(SValue *v)
+{
+    return (v->r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && DP_IS_SLOT(v->c.ul)
+           && (v->type.t & VT_BTYPE) == VT_PTR;
+}
+
+void dp_pend_flush(void)
+{
+    SValue *p;
+    int i, flags;
+    if (!dp_npend)
+        return;
+    for (p = vstack; p <= vtop; p++)
+        if (p->r2 == TREG_PEND) {
+            int r = get_reg(RC_INT);
+            p->r2 = VT_CONST;
+            load(r, p);
+            p->r = r;
+        }
+    flags = vtop >= vstack && (vtop->r & VT_VALMASK) == VT_CMP;
+    if (flags)
+        pr("php\n");
+    for (i = 0; i < dp_npend; i++) {
+        int k = dp_pend[i].k, d = dp_pend[i].delta;
+        pr("; p++ of dp local %d, deferred\n", k);
+        if (d == 1)
+            pr("inc.b tcc__l%d\n", k);
+        else if (d == -1)
+            pr("dec.b tcc__l%d\n", k);
+        else
+            pr("lda.b tcc__l%d\nclc\nadc.w #%d\nsta.b tcc__l%d\n", k, d, k);
+    }
+    if (flags)
+        pr("plp\n");
+    dp_npend = 0;
+}
+
+/* inc(): p++ (dir 1) or p-- (-1) with its value used; 1 if deferred */
+int dp_pend_post(int dir)
+{
+    int k, sz, i;
+    if (nocode_wanted || !dp_ptr_slot(vtop) || vtop->r2 == TREG_PEND)
+        return 0;
+    sz = pointed_size(&vtop->type);
+    if (sz <= 0)
+        return 0;
+    k = (vtop->c.ul - DP_SLOT) / 2;
+    for (i = 0; i < dp_npend; i++)
+        if (dp_pend[i].k == k)
+            break;
+    if (i < dp_npend || dp_npend == 4)
+        dp_pend_flush();        /* stepped again: the first step first */
+    dp_pend[dp_npend].k = k;
+    dp_pend[dp_npend].delta = dir * sz;
+    dp_npend++;
+    vtop->r2 = TREG_PEND;
+    return 1;
+}
+
 /* the real pass: an automatic local declared; its slot, or -1 */
 int dp_take_slot(void)
 {
     int k, idx = dp_decls++;
     for (k = 0; k < dp_ncand; k++)
         if (dp_chosen[k] == idx) {
-            dp_used[k] = 1;
-            return k;
+            int sl = dp_cslot[k];
+            dp_used[sl] = 1;
+            if (dp_stat[idx].ptr)
+                dp_used[sl + 1] = 1;
+            return sl;
         }
     return -1;
 }
@@ -1065,6 +1154,10 @@ static void load_impl(int r, SValue *sv)
         if (!(fr & VT_LVAL))
             error("ICE: the address of a direct page local");
         pr("; ld%d dp local %d -> tcc__r%d\n", length, k, r);
+        if (length == 4) {      /* a long pointer: lK and lK+1 */
+            pr("lda.b tcc__l%d\nsta.b tcc__r%d\nlda.b tcc__l%d\nsta.b tcc__r%dh\n", k, r, k + 1, r);
+            return;
+        }
         if (length == 1) {
             pr("lda.w #0\nsep #$20\nlda.b tcc__l%d\nrep #$20\n", k);
             if (!(ft & VT_UNSIGNED))
@@ -1436,7 +1529,9 @@ static void store_impl(int r, SValue *sv)
     if ((fr & VT_VALMASK) == VT_LOCAL && (fr & VT_LVAL) && DP_IS_SLOT(fc)) {   /* a direct page local */
         int k = (fc - DP_SLOT) / 2;
         pr("; st%d tcc__r%d -> dp local %d\n", length, r, k);
-        if (length == 1)
+        if (length == 4)        /* a long pointer: lK and lK+1 */
+            pr("lda.b tcc__r%d\nsta.b tcc__l%d\nlda.b tcc__r%dh\nsta.b tcc__l%d\n", r, k, r, k + 1);
+        else if (length == 1)
             pr("sep #$20\nlda.b tcc__r%d\nsta.b tcc__l%d\nrep #$20\n", r, k);
         else
             pr("lda.b tcc__r%d\nsta.b tcc__l%d\n", r, k);
@@ -1938,6 +2033,7 @@ static int jcc_begin(int cond)
 
 int gtst(int inv, int t)
 {
+    dp_pend_flush();            /* deferred p++ before any branch */
     int v, r;
     v = vtop->r & VT_VALMASK;
     r = ind;
@@ -2947,7 +3043,7 @@ void gfunc_prolog(CType *func_type)
             pr(".endif\n");
         }
         /* the direct page locals' slots it uses, saved (the prescan ran) */
-        for (k = 0; k < dp_ncand; k++)
+        for (k = 0; k < dp_nslots; k++)
             pr(".ifgr __%s_dpu%d 0\nlda.b tcc__l%d\nsta __%s_dps%d + __%s_locals + 1,s\n.endif\n",
                current_fn, k, k, current_fn, k, current_fn);
     }
@@ -2989,7 +3085,7 @@ void gfunc_epilog(void)
 {
     int k;
     /* the direct page locals' slots back as the caller had them */
-    for (k = 0; k < dp_ncand; k++)
+    for (k = 0; k < dp_nslots; k++)
         pr(".ifgr __%s_dpu%d 0\nlda __%s_dps%d + __%s_locals + 1,s\nsta.b tcc__l%d\n.endif\n",
            current_fn, k, current_fn, k, current_fn, k);
     pr("; add sp, #__%s_locals\n", current_fn);
@@ -3018,7 +3114,7 @@ void gfunc_epilog(void)
     section_closed = 1;
 
     /* the direct page locals: frame room to save each slot used */
-    for (k = 0; k < dp_ncand; k++) {
+    for (k = 0; k < dp_nslots; k++) {
         if (dp_used[k]) {
             loc -= 2;
             fc_add_def(".define __%s_dpu%d 1", current_fn, k);
@@ -3029,6 +3125,7 @@ void gfunc_epilog(void)
         }
     }
     dp_ncand = 0;
+    dp_nslots = 0;
 
     /* fastcall parameters: a frame copy if the function made calls */
     if (fc_n) {

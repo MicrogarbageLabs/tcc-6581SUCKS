@@ -629,6 +629,20 @@ static int a_dead_after(flow_t *F, size_t i)
 
 static int is_cond_branch(const line_t *l);
 static int mentions_reg(const char *s, int bit);
+static int nz_needed_after(flow_t *F, size_t i);
+
+/* the line names direct page slot "tcc__lK" (the whole word) */
+static int mentions_dp(const char *s, const char *name)
+{
+    size_t n = strlen(name);
+    const char *p = s;
+    while ((p = strstr(p, name)) != NULL) {
+        if (!isalnum((unsigned char) p[n]) && p[n] != '_')
+            return 1;
+        p += n;
+    }
+    return 0;
+}
 
 /* A is dead from line j on: every path loads it anew (or returns, or calls:
    a callee doesn't read the caller's A) before anything reads it; past
@@ -700,6 +714,64 @@ size_t forwardOperands(dynArray *file)
 
         if (gone[i] || a->kind != K_INSN || a->keep)
             continue;
+
+        /* a load nothing reads: lda of a pseudo-register or slot (no side
+           effect, unlike an I/O register) with A dead after and its N and Z
+           unread */
+        if (is(a, "lda") && !strncmp(a->op, "tcc__", 5) && !a->vol && !a->labelled && !strchr(a->op, ',')
+            && a_dead_from(&F, i + 1, 0) && !nz_needed_after(&F, i)) {
+            drop_line(file, i);
+            gone[i] = 1;
+            done++;
+            continue;
+        }
+
+        /* a long pointer copied from direct page slots (816-gen.c: a pointer
+           local in tcc__lK and lK+1) and read through:
+             lda.b tcc__lK / sta.b rN / lda.b tcc__lK+1 / sta.b rNh
+             ... [rN] ...           ->  ... [tcc__lK] ...
+           while neither pair changes, with no label or branch between; the
+           copy, unread then, goes as a dead store */
+        if (is(a, "lda") && !strncmp(a->op, "tcc__l", 6) && isdigit((unsigned char) a->op[6]) && !a->op[7]
+            && !a->m8 && i + 3 < F.n && !gone[i + 1] && !gone[i + 2] && !gone[i + 3]) {
+            int k = a->op[6] - '0', rn = stored_reg(&F.L[i + 1]);
+            line_t *c2 = &F.L[i + 2];
+            char lo[16], hi[16], ind[24], to[24];
+            snprintf(lo, sizeof lo, "tcc__l%d", k);
+            snprintf(hi, sizeof hi, "tcc__l%d", k + 1);
+            if (rn >= 0 && rn < 32 && !(rn & 1) && is(&F.L[i + 1], "sta") && is(c2, "lda") && !strcmp(c2->op, hi)
+                && stored_reg(&F.L[i + 3]) == rn + 1 && is(&F.L[i + 3], "sta") && !F.L[i + 1].labelled
+                && !c2->labelled && !F.L[i + 3].labelled) {
+                size_t u;
+                int hits = 0;
+                snprintf(ind, sizeof ind, "[tcc__r%d]", rn / 2);
+                snprintf(to, sizeof to, "[tcc__l%d]", k);
+                for (u = i + 4; u < F.n; u++) {
+                    line_t *m = &F.L[u];
+                    char *at;
+                    if (gone[u] || m->kind != K_INSN || m->labelled || m->flow)
+                        break;
+                    if (mentions_dp(F.code[u], lo) || mentions_dp(F.code[u], hi))
+                        break;          /* the slot read or changed: stop here */
+                    if ((at = strstr(F.code[u], ind)) != NULL && !m->keep) {
+                        snprintf(buf, sizeof buf, "%.*s%s%s", (int) (at - F.code[u]), F.code[u], to,
+                                 at + strlen(ind));
+                        replace_line(file, u, buf);
+                        gone[u] = 1;
+                        hits++;
+                    }
+                    if (stored_reg(m) == rn || stored_reg(m) == rn + 1 || ((m->def >> rn) & 1)
+                        || ((m->def >> (rn + 1)) & 1))
+                        break;
+                    if (!((F.out[u] >> rn) & 1) && !((F.out[u] >> (rn + 1)) & 1))
+                        break;          /* the copy is dead from here */
+                }
+                if (hits) {
+                    done++;
+                    continue;
+                }
+            }
+        }
 
         /* an unsigned byte loaded:
              lda.w #0 / sep #$20 / lda M / rep #$20  ->  lda M / and.w #$00ff
