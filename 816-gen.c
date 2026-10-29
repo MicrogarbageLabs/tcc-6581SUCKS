@@ -3018,18 +3018,37 @@ void gfunc_prolog(CType *func_type)
 
     {
         int ns = fc_nslots(FUNC_CALL(func_type->ref->r)), k;
+        /* stack parameters the dry run chose for direct page slots: their
+           slot and stack address, copied in once the slots are saved */
+        int pk[DP_MAX], pa[DP_MAX], pw[DP_MAX], np = 0;
         fc_n = 0;
         fc_calls = 0;
         fc_args_ctx = 0;
         while ((sym = sym->next)) {
             CType *type = &sym->type;
+            Sym *ps;
+            int slot = -1;
             if (fc_n < ns && fc_fits(type)) {   /* in a slot, not on the stack */
                 sym_push(sym->v & ~SYM_FIELD, type, VT_LOCAL | VT_LVAL, FC_SLOT + 2 * fc_n);
                 fc_n++;
                 continue;
             }
-            sym_push(sym->v & ~SYM_FIELD, type, VT_LOCAL | VT_LVAL, addr);
             size = type_size(type, &align);
+            /* ranked like a local: the dry run measures it, the real pass
+               may put it in a slot (matched by declaration order) */
+            if (!dry_run)
+                slot = dp_take_slot();
+            if (slot >= 0 && np < DP_MAX) {
+                ps = sym_push(sym->v & ~SYM_FIELD, type, VT_LOCAL | VT_LVAL, DP_SLOT + 2 * slot);
+                pk[np] = slot;
+                pa[np] = addr;
+                pw[np] = size > 2 ? 2 : 1;
+                np++;
+            } else {
+                ps = sym_push(sym->v & ~SYM_FIELD, type, VT_LOCAL | VT_LVAL, addr);
+                if (dry_run)
+                    dp_note_decl(ps, type);
+            }
             addr += size;
             n += size;
         }
@@ -3046,6 +3065,13 @@ void gfunc_prolog(CType *func_type)
         for (k = 0; k < dp_nslots; k++)
             pr(".ifgr __%s_dpu%d 0\nlda.b tcc__l%d\nsta __%s_dps%d + __%s_locals + 1,s\n.endif\n",
                current_fn, k, k, current_fn, k, current_fn);
+        /* ... then the parameters given slots, from the stack */
+        for (k = 0; k < np; k++) {
+            int w;
+            pr("; parameter at %d -> dp local %d\n", pa[k], pk[k]);
+            for (w = 0; w < pw[k]; w++)
+                pr("lda %d + __%s_locals + 1,s\nsta.b tcc__l%d\n", pa[k] + 2 * w, current_fn, pk[k] + w);
+        }
     }
     loc = 0; // huh squared?
 }
