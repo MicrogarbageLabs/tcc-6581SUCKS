@@ -311,6 +311,17 @@ void save_reg(int r)
     saved = 0;
     l = 0;
 #ifdef TCC_TARGET_816
+    if (r == TREG_XIV) {
+        /* the loop's index in X: into a register, which then spills as
+           usual (a caller of save_reg wants the value out of registers) */
+        int n = get_reg(RC_INT);
+        pr("stx.b tcc__r%d\n", n);
+        for (p = vstack; p <= vtop; p++)
+            if ((p->r & VT_VALMASK) == TREG_XIV)
+                p->r = (p->r & ~VT_VALMASK) | n;
+        save_reg(n);
+        return;
+    }
     /* a compare's flags may be waiting at vtop (VT_CMP): the spill's lda
        would change them, so php/plp around it, one byte more on the stack
        for the locals' offsets meanwhile */
@@ -1705,6 +1716,14 @@ void gen_op(int op)
             vpushll(u);
 #else
             /* XXX: cast to int ? (long long case) */
+#ifdef TCC_TARGET_816
+            /* the X loop's counter indexing a global: the index is in X */
+            if (op == '+' && xl_index(u)) {
+                gen_opic(op);
+                vtop->type = type1;
+                return;
+            }
+#endif
             vpushi(u);
 #endif
             gen_op('*');
@@ -4758,8 +4777,10 @@ static void block(int *bsym, int *csym, int *case_sym, int *def_sym, int case_re
             next();
             {
                 DiscardedExprContext for_incr_cand = {')'};
+                yl_in_inc = 1;              /* its store steps X too */
                 gexpr(&for_incr_cand);
                 vpop();
+                yl_in_inc = 0;
             }
             skip(')');
             restore_parse_state(&saved);

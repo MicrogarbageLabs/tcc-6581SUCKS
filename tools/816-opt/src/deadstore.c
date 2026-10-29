@@ -628,6 +628,7 @@ static int a_dead_after(flow_t *F, size_t i)
 }
 
 static int is_cond_branch(const line_t *l);
+static int mentions_reg(const char *s, int bit);
 
 /* A is dead from line j on: every path loads it anew (or returns, or calls:
    a callee doesn't read the caller's A) before anything reads it; past
@@ -699,6 +700,65 @@ size_t forwardOperands(dynArray *file)
 
         if (gone[i] || a->kind != K_INSN || a->keep)
             continue;
+
+        /* an unsigned byte loaded:
+             lda.w #0 / sep #$20 / lda M / rep #$20  ->  lda M / and.w #$00ff
+           (8 cycles, not 13). It reads the byte after M too, so M is a named
+           object (a symbol or a pseudo-register, not an address or through
+           a pointer) and not volatile; the next instruction doesn't look at
+           N (bit 15 now, bit 7 before) */
+        if (is(a, "lda") && !a->m8 && !strcmp(a->rest, ".w #0") && i + 4 < F.n && !gone[i + 1] && !gone[i + 2]
+            && !gone[i + 3] && is(&F.L[i + 1], "sep") && !strcmp(F.L[i + 1].op, "#$20") && is(&F.L[i + 2], "lda")
+            && is(&F.L[i + 3], "rep") && !strcmp(F.L[i + 3].op, "#$20") && !F.L[i + 1].labelled
+            && !F.L[i + 2].labelled && !F.L[i + 3].labelled && !F.L[i + 2].vol && !F.L[i + 2].keep
+            && (isalpha((unsigned char) F.L[i + 2].op[0]) || F.L[i + 2].op[0] == '_')
+            && !strchr(F.L[i + 2].op, '[') && !strchr(F.L[i + 2].op, '(')) {
+            static const char *next_ok[] = {"sta", "xba", "clc", "sec", "cmp", "and", "ora", "eor", "adc", "sbc",
+                                            "tax", "tay", "pha", NULL};
+            line_t *nx = &F.L[i + 4];
+            int k, fine = 0;
+            for (k = 0; next_ok[k]; k++)
+                if (is(nx, next_ok[k]))
+                    fine = 1;
+            if (fine && !nx->labelled) {
+                snprintf(buf, sizeof buf, "lda%s", F.L[i + 2].rest);
+                replace_line(file, i, buf);
+                replace_line(file, i + 1, "and.w #$00ff");
+                drop_line(file, i + 2);
+                drop_line(file, i + 3);
+                gone[i] = gone[i + 1] = gone[i + 2] = gone[i + 3] = 1;
+                done++;
+                continue;
+            }
+        }
+
+        /* the value parked to be added to something loaded next:
+             sta.b rN / lda M / [clc] / adc.b rN  ->  [clc] / adc M
+           (and, ora, eor too: all commutative), rN dead after */
+        r = stored_reg(a);
+        if (r >= 0 && r < 32 && !(r & 1) && is(a, "sta") && !a->m8 && i + 2 < F.n && !gone[i + 1]
+            && is(&F.L[i + 1], "lda") && !F.L[i + 1].labelled && !F.L[i + 1].vol && !F.L[i + 1].keep
+            && !F.L[i + 1].m8 && F.L[i + 1].op[0] && !mentions_reg(F.code[i + 1], r)
+            && !mentions_reg(F.code[i + 1], r + 1) && reg_operand(&F.L[i + 1], "lda") != r) {
+            static const char *comm[] = {"adc", "and", "ora", "eor", NULL};
+            size_t u = i + 2;
+            int k, hit = -1;
+            if (is(&F.L[u], "clc") && !F.L[u].labelled && u + 1 < F.n)
+                u++;
+            for (k = 0; comm[k]; k++)
+                if (reg_operand(&F.L[u], comm[k]) == r && (k == 0 || u == i + 2))
+                    hit = k;    /* adc after its clc; the others straight after */
+            if (hit >= 0 && !gone[u] && !F.L[u].labelled && !F.L[u].m8 && !((F.out[u] >> r) & 1)
+                && !((F.out[u] >> (r + 1)) & 1)) {
+                snprintf(buf, sizeof buf, "%s%s", comm[hit], F.L[i + 1].rest);
+                replace_line(file, u, buf);
+                drop_line(file, i);
+                drop_line(file, i + 1);
+                gone[i] = gone[i + 1] = gone[u] = 1;
+                done++;
+                continue;
+            }
+        }
 
         /* a loop's counter in Y (816-gen.c yl_*):
              sty rN / lda rN        ->  tya          (rN dead after)

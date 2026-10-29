@@ -600,14 +600,32 @@ void dp_choose(void)
    when no loop inside it is). The real pass loads a chosen loop's counter
    into Y before its test; inside, a read is sty, a write ldy; at the exit
    (where the test and every break meet) Y goes back to the counter's home.
-   A return inside needs nothing: the counter dies with the function. */
+   A return inside needs nothing: the counter dies with the function.
+
+   And its index in X: in such a loop with no for loop inside, stepped by
+   ++ or --, the counter written by nothing but its increment, X holds
+   counter * S for the whole loop, S the size of the elements it indexes
+   (one size per loop). The dry run speculates: a global array indexed by
+   the counter (gen_op's pointer add) takes register TREG_XIV, "the index
+   is in X", instead of computing counter * S into a register, so the
+   access is lda.l arr,x with no ldx; the loop qualifies when its code then
+   has no other X write. The real pass sets X before the test (tyx, or the
+   counter times S then ldx) and steps it by S after the increment's ldy. A
+   use of the scaled value as a number gets stx into a register. */
 #define YL_MAX 256
+#define TREG_XIV 8              /* a register no value is ever allocated: "in X" */
 typedef struct {
     int tok;                    /* the counter's name */
     Sym *sym;                   /* ... in the dry run */
     int start, end;             /* its text in the dry run */
     int parent, ok, gotos, chosen, child_chosen;
     int two;                    /* the counter is 2 bytes (read while its symbol lives) */
+    int has_child;              /* a for loop inside */
+    int step;                   /* the increment: +1 (++), -1 (--), 0 (+= n: no X) */
+    int scale;                  /* the element size X steps by, 0 none yet */
+    int cwrites;                /* writes to the counter besides the increment */
+    int test_stores[4], ntest;  /* locals the test writes (before the counter is known) */
+    int xok, xchosen;
 } yl_t;
 static yl_t yl[YL_MAX];
 static int yl_n;                /* loops the dry run recorded */
@@ -617,6 +635,8 @@ static int yl_count;            /* for loops met so far in the real pass */
 int goto_seen;                  /* gotos and labels parsed: a loop's count must not move */
 static int yl_active, yl_c;     /* a counter in Y now, and its home's offset */
 static SValue yl_home;
+int yl_in_inc;                  /* the loop's increment is being compiled */
+static int xl_active, xl_scale, xl_step;  /* the index in X now: counter * scale, step */
 
 void store(int r, SValue *sv);
 
@@ -626,6 +646,84 @@ static void yl_reset(void)
     yl_norder = 0;
     yl_sp = 0;
     yl_active = 0;
+    xl_active = 0;
+}
+
+/* any write to X in emitted text, or a call */
+static int text_writes_x(const char *p, const char *end)
+{
+    static const char *ops[] = {"ldx", "tax", "tyx", "inx", "dex", "plx", "tsx", "jsr", "jsl", "mvn", "mvp",
+                                "rti", "brk", "cop", NULL};
+    while (p < end) {
+        const char *e = memchr(p, '\n', end - p);
+        size_t n;
+        int k;
+        if (!e)
+            e = end;
+        while (p < e && (*p == ' ' || *p == '\t'))
+            p++;
+        n = e - p;
+        if (n >= 3 && *p != ';')
+            for (k = 0; ops[k]; k++)
+                if (!strncmp(p, ops[k], 3))
+                    return 1;
+        p = e + 1;
+    }
+    return 0;
+}
+
+/* gen_op's pointer add, vtop[-1] a pointer and vtop the index, u the
+   element size: the index into X (TREG_XIV) when it is the X loop's
+   counter and the pointer a global's address; 1 if so */
+static int is_sym_addr(SValue *v);
+int xl_index(int u)
+{
+    int k;
+    if (vtop->r != (VT_LOCAL | VT_LVAL) || !is_sym_addr(&vtop[-1]) || u <= 0)
+        return 0;
+    if (dry_run) {
+        if (!yl_sp || (k = yl_stack[yl_sp - 1]) < 0 || !yl[k].sym || !yl[k].two || !yl[k].step || yl[k].has_child
+            || vtop->c.ul != (unsigned long) yl[k].sym->c)
+            return 0;
+        if (yl[k].scale && yl[k].scale != u)
+            return 0;           /* another size: the ldx it gets rules X out */
+        yl[k].scale = u;
+    } else if (!xl_active || vtop->c.ul != (unsigned long) yl_c || u != xl_scale)
+        return 0;
+    vtop->r = TREG_XIV;
+    vtop->type.t = VT_INT | VT_UNSIGNED;
+    return 1;
+}
+
+/* the dry run: a store to a local; a write to the innermost loop's counter
+   that isn't its increment rules X out */
+static void yl_note_store(SValue *sv)
+{
+    int k;
+    if (!dry_run || yl_in_inc || !yl_sp || (k = yl_stack[yl_sp - 1]) < 0
+        || (sv->r & (VT_VALMASK | VT_LVAL)) != (VT_LOCAL | VT_LVAL))
+        return;
+    if (yl[k].sym) {
+        if (sv->c.ul == (unsigned long) yl[k].sym->c)
+            yl[k].cwrites++;
+    } else if (yl[k].ntest < 4)
+        yl[k].test_stores[yl[k].ntest++] = sv->c.ul;
+    else
+        yl[k].cwrites++;        /* too many to tell */
+}
+
+/* the real pass: X steps with the counter, after the increment's ldy */
+static void xl_after_store(void)
+{
+    int n, i;
+    if (!xl_active || !yl_in_inc)
+        return;
+    n = xl_scale * xl_step;
+    if (n >= -3 && n <= 3)
+        for (i = 0; i < (n < 0 ? -n : n); i++)
+            pr(n < 0 ? "dex\n" : "inx\n");
+    else
+        pr("txa\nclc\nadc.w #%d\ntax\n", n);
 }
 
 /* any use of Y in emitted text: an instruction, an index, or a call */
@@ -665,6 +763,8 @@ void yl_loop_begin(void)
             yl[k].start = ind;
             yl[k].gotos = goto_seen;
             yl[k].parent = yl_sp ? yl_stack[yl_sp - 1] : -1;
+            if (yl[k].parent >= 0)
+                yl[yl[k].parent].has_child = 1;
         }
         if (yl_sp < 64)
             yl_stack[yl_sp++] = k;
@@ -688,6 +788,23 @@ void yl_loop_begin(void)
                 yl_active = 1;
                 yl_c = s->c;
                 on = 1;
+                if (yl[k].xchosen) {
+                    /* and counter * S in X */
+                    pr("; the loop's index in X\n");
+                    if (yl[k].scale == 1)
+                        pr("tyx\n");
+                    else {
+                        vset(&s->type, s->r, s->c);
+                        vpushi(yl[k].scale);
+                        gen_op('*');
+                        r = gv(RC_INT);
+                        pr("ldx.b tcc__r%d\n", r);
+                        vpop();
+                    }
+                    xl_active = 1;
+                    xl_scale = yl[k].scale;
+                    xl_step = yl[k].step;
+                }
             }
         }
         if (yl_sp < 64)
@@ -712,8 +829,15 @@ void yl_loop_inc(int *ids, int n)
     if (!t || !(s = sym_find(t)) || (s->r & (VT_VALMASK | VT_LVAL)) != (VT_LOCAL | VT_LVAL))
         return;
     {
-        int align;
+        int align, j;
         yl[k].two = type_size(&s->type, &align) == 2 && !is_float(s->type.t);
+        if (ids[1] == TOK_INC || ids[0] == TOK_INC)
+            yl[k].step = 1;
+        else if (ids[1] == TOK_DEC || ids[0] == TOK_DEC)
+            yl[k].step = -1;
+        for (j = 0; j < yl[k].ntest; j++)
+            if (yl[k].test_stores[j] == s->c)
+                yl[k].cwrites++;  /* the test wrote it */
     }
     yl[k].tok = t;
     yl[k].sym = s;
@@ -733,6 +857,9 @@ void yl_loop_end(void)
         yl[k].ok = yl[k].tok && goto_seen == yl[k].gotos
                    && !text_uses_y((char *) cur_text_section->data + yl[k].start,
                                    (char *) cur_text_section->data + yl[k].end);
+        yl[k].xok = yl[k].ok && yl[k].scale && yl[k].step && !yl[k].has_child && !yl[k].cwrites
+                    && !text_writes_x((char *) cur_text_section->data + yl[k].start,
+                                      (char *) cur_text_section->data + yl[k].end);
         if (yl_norder < YL_MAX)
             yl_order[yl_norder++] = k;
         return;
@@ -741,6 +868,7 @@ void yl_loop_end(void)
         /* Y back to the counter's home, on the way out */
         int r = get_reg(RC_INT);
         yl_active = 0;
+        xl_active = 0;
         pr("; the loop's counter back from Y\nsty.b tcc__r%d\n", r);
         store(r, &yl_home);
     }
@@ -761,6 +889,7 @@ static void yl_choose(void)
         if (!d || d->addr || !d->fits || !yl[k].two)
             continue;
         yl[k].chosen = 1;
+        yl[k].xchosen = yl[k].xok;
         for (p = yl[k].parent; p >= 0; p = yl[p].parent)
             yl[p].child_chosen = 1;
     }
@@ -834,9 +963,14 @@ static int is_int_val(SValue *v)
 static void idx_to_ptr(int r, SValue *sv)
 {
     char *sy = get_sym_str(sv->sym);
-    pr("; idx addr [%s + %d + tcc__r%d] -> tcc__r%d\n", sy, sv->c.i, sv->r & VT_VALMASK, r);
+    int ix = sv->r & VT_VALMASK;
+    if (ix == TREG_XIV) {
+        pr("stx.b tcc__r%d\n", r);    /* the loop's index, from X */
+        ix = r;
+    }
+    pr("; idx addr [%s + %d + tcc__r%d] -> tcc__r%d\n", sy, sv->c.i, ix, r);
     pr("lda.w #%s + %d\nclc\nadc.b tcc__r%d\nsta.b tcc__r%d\nlda.w #:%s\nsta.b tcc__r%dh\n",
-       sy, sv->c.i, sv->r & VT_VALMASK, r, sy, r);
+       sy, sv->c.i, ix, r, sy, r);
 }
 
 int ll_workaround = 0;
@@ -887,6 +1021,10 @@ static void load_impl(int r, SValue *sv)
     }
     int base = -1;
     v = fr & VT_VALMASK;
+    if (v == TREG_XIV && !is_idx(sv)) {
+        pr("stx.b tcc__r%d\n", r);    /* the loop's scaled index, as a number */
+        return;
+    }
     if (is_idx(sv)) {
         char *sy = get_sym_str(sv->sym);
         if (!(fr & VT_LVAL)) {      /* the address */
@@ -895,7 +1033,8 @@ static void load_impl(int r, SValue *sv)
         }
         /* the element: as a symbol's, indexed by X */
         pr("; ld%d [%s + %d + tcc__r%d], r%d\n", length, sy, fc, v, r);
-        pr("ldx.b tcc__r%d\n", v);
+        if (v != TREG_XIV)
+            pr("ldx.b tcc__r%d\n", v);    /* else the loop's index is in X */
         if (is_float(ft)) {
             if (length != 4)
                 error("ICE idx float");
@@ -1267,11 +1406,14 @@ static void store_impl(int r, SValue *sv)
     if (yl_active && (fr & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && sv->c.ul == (unsigned long) yl_c
         && length == 2 && r < TREG_F0) {
         pr("ldy.b tcc__r%d\n", r);    /* the loop's counter, in Y */
+        xl_after_store();
         return;
     }
+    yl_note_store(sv);
     if (is_idx(sv) && (fr & VT_LVAL)) {     /* an indexed global's element */
         char *sy = get_sym_str(sv->sym);
-        pr("ldx.b tcc__r%d\n", fr & VT_VALMASK);
+        if ((fr & VT_VALMASK) != TREG_XIV)
+            pr("ldx.b tcc__r%d\n", fr & VT_VALMASK);
         switch (length) {
         case 1:
             pr("sep #$20\nlda.b tcc__r%d\nsta.l %s + %d,x\nrep #$20\n", r, sy, fc);
@@ -1924,12 +2066,12 @@ void gen_opi(int op)
             if (is_sym_addr(a)) {
                 sym = a->sym;
                 disp = a->c.i;
-                ix = gv(RC_INT);            /* the index, vtop */
+                ix = b->r == TREG_XIV ? TREG_XIV : gv(RC_INT);    /* the index, vtop */
             } else {
                 sym = b->sym;
                 disp = b->c.i;
                 vswap();
-                ix = gv(RC_INT);
+                ix = vtop->r == TREG_XIV ? TREG_XIV : gv(RC_INT);
                 vswap();
             }
             vtop--;
