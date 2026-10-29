@@ -101,6 +101,15 @@ To reproduce, run `sh tests/run.sh bench_core bench_more`. For PVSnesLib's numbe
   direct-page slots (`tcc__a0`–`a3`) instead of on the stack.
 - **Return marks.** Each `rtl` is marked with what the function returns (`; ret16`, `; ret32`, ...).
   Volatile accesses are marked `; volatile`. Both are for the optimiser.
+- **Inline assembly** with operands: GCC-style `asm`, described under [Using it](#inline-assembly).
+- **`static inline` functions are expanded** where they're called. Each argument goes into a local
+  and the body is compiled in place, with no call or return, and with no call left in a loop that
+  calls one, so the loop can keep its counter in Y. Some functions stay ordinary calls:
+  - recursive ones;
+  - ones with `goto`, a `static` local or `__asmraw__`;
+  - long ones (over 160 tokens);
+  - ones with struct arguments or results, `...`, or an old-style declaration;
+  - one whose address is taken. It's also compiled as a normal function for that use.
 
 ### The optimiser
 
@@ -157,11 +166,45 @@ with PVSnesLib's compiler. `tests/rt/crt0.asm` is a complete example.
   -mhx422    multiplies on the HX-422 cart's hardware multiplier ($3C30)
 ```
 
+### Inline assembly
+
+GCC-style `asm` works, with operands, so assembly can work on C variables without knowing where the
+compiler keeps them:
+
+```c
+u16 sum, v;
+asm("lda.b %1\n clc\n adc.b %2\n sta.b %0" : "=r"(sum) : "r"(a), "r"(b));
+asm volatile("xba" : "=a"(v) : "a"(x));                 /* swap a word's bytes */
+asm("lda.l %1,x" : "=a"(v) : "m"(table[0]), "x"(i * 2));
+asm("ldx.w #8\nl%=:\n asl a\n dex\n bne l%=" ::: "a", "x");
+```
+
+| Constraint | The operand | `%N` in the template |
+|---|---|---|
+| `r` | in a pseudo-register | `tcc__rK` (`%HN`: `tcc__rKh`, a pointer's high word) |
+| `a`, `x`, `y` | loaded into A, X or Y before the template, or stored from it after | the pseudo-register |
+| `i`, `n` | a constant, or a global's address | the number, or `sym + offset` |
+| `m` | a global, in memory | `sym + offset` (write `lda.l %N`) |
+| `0`–`9` | an input in the same register as that output | |
+
+- **Outputs** start with `=` (written) or `+` (read and written). A local is an `r` operand, not `m`.
+- **Template codes:** `%[name]` refers to a named operand (`[name] "r"(x)`), `%%` is a `%`, and `%=`
+  is a number unique to the statement, for labels.
+- **Clobbers:** `"x"` and `"y"` keep a loop's counter and index out of those registers. `"a"`,
+  `"cc"` and `"memory"` are accepted; no value lives in A, the flags or a register across a
+  statement anyway.
+- **No operands:** an `asm` with no `:` is copied as written, `%` included, as GCC does.
+- **Outside a function:** `asm("...")` gets a section of its own, so a whole routine can live in a C
+  file. `tests/cases/asm.c` has one, called from C.
+
+The code must leave A, X and Y 16 bits wide, and D, DB and S as it found them. The fork's 816-opt
+leaves every `asm` block, and every `__asmraw__` block, exactly as written. PVSnesLib's own 816-opt
+doesn't know about them.
+
 ### Things to know about this target
 
 - `int` and `long` are 16 bits; `long long` is 32 bits.
 - Pointer arithmetic doesn't carry into the bank byte, as in PVSnesLib.
-- There is no inline assembly.
 - A parameter in a fastcall slot has no address. Copy it to a local first if you need `&`.
 
 ## Tests

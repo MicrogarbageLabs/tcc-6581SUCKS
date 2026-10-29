@@ -3582,6 +3582,118 @@ static void vpush_tokc(int t)
     vsetc(&type, VT_CONST, &tokc);
 }
 
+#ifdef TCC_TARGET_816
+/* static inline functions expanded where they're called (the 816-tcc
+   fork). At f(a, b), with f's body saved (a static inline function is
+   kept as tokens until the end of the file, compiled only if something
+   still refers to it): each argument goes, converted to its parameter's
+   type, into a new local; the body is compiled there with the parameter
+   names meaning those locals; a return stores its value in a result local
+   and jumps to the end, and that local is the call's value. Not expanded
+   (an ordinary call instead): recursion, a body with goto, a static local
+   or __asmraw__ (a label or a variable would be there twice), more than
+   INLINE_MAX_TOKENS tokens, a struct result or parameter, ... or an
+   old-style declaration. */
+#define INLINE_MAX_TOKENS 160
+typedef struct {
+    CType ret;                  /* the result's type, void for none */
+    int ret_loc;                /* its local */
+    int jumps;                  /* the returns' jumps to the end */
+} InlineCtx;
+static InlineCtx *inline_ctx;
+static Sym *inline_stack[8];
+static int inline_depth;
+
+static int inline_expand(Sym *s)
+{
+    struct InlineFunc *fn = NULL;
+    Sym *f = s->type.ref, *pa;
+    int i, n, ntok, ploc[16], size, align;
+    int *tp;
+    CValue cv;
+    InlineCtx ctx, *prev;
+    ParseState saved;
+    Sym *scope;
+
+    for (i = 0; i < tcc_state->nb_inline_fns; i++)
+        if (tcc_state->inline_fns[i]->sym == s)
+            fn = tcc_state->inline_fns[i];
+    if (!fn || inline_depth >= 8 || f->c == FUNC_OLD || f->c == FUNC_ELLIPSIS
+        || (f->type.t & VT_BTYPE) == VT_STRUCT)
+        return 0;
+    for (i = 0; i < inline_depth; i++)
+        if (inline_stack[i] == s)
+            return 0;           /* recursion */
+    n = 0;
+    for (pa = f->next; pa; pa = pa->next)
+        if ((pa->type.t & VT_BTYPE) == VT_STRUCT || ++n > 16)
+            return 0;
+    ntok = 0;
+    for (tp = fn->token_str;;) {
+        int t;
+        TOK_GET(t, tp, cv);
+        if (t == 0 || t == TOK_EOF)
+            break;
+        if (t == TOK_GOTO || t == TOK_STATIC || t == TOK_ASMRAW1 || t == TOK_ASMRAW2 || t == TOK_ASMRAW3
+            || ++ntok > INLINE_MAX_TOKENS)
+            return 0;
+    }
+
+    /* the arguments, each into its local */
+    next();                     /* '(' */
+    n = 0;
+    for (pa = f->next; pa; pa = pa->next) {
+        if (n)
+            skip(',');
+        expr_eq(NULL);
+        gen_assign_cast(&pa->type);
+        size = type_size(&pa->type, &align);
+        loc = (loc - size) & -align;
+        ploc[n++] = loc;
+        vset(&pa->type, VT_LOCAL | VT_LVAL, loc);
+        vswap();
+        vstore();
+        vpop();
+    }
+    skip(')');
+    ctx.ret = f->type;
+    ctx.ret.t &= ~VT_STORAGE;
+    ctx.ret_loc = 0;
+    ctx.jumps = 0;
+    if ((ctx.ret.t & VT_BTYPE) != VT_VOID) {
+        size = type_size(&ctx.ret, &align);
+        loc = (loc - size) & -align;
+        ctx.ret_loc = loc;
+    }
+
+    /* the body, there */
+    save_parse_state(&saved);
+    scope = local_stack;
+    n = 0;
+    for (pa = f->next; pa; pa = pa->next)
+        sym_push(pa->v & ~SYM_FIELD, &pa->type, VT_LOCAL | VT_LVAL, ploc[n++]);
+    prev = inline_ctx;
+    inline_ctx = &ctx;
+    inline_stack[inline_depth++] = s;
+    pr("; inline %s\n", get_tok_str(s->v, NULL));
+    macro_ptr = fn->token_str;
+    next();
+    block(NULL, NULL, NULL, NULL, 0, 0);
+    gsym(ctx.jumps);
+    inline_depth--;
+    inline_ctx = prev;
+    sym_pop(&local_stack, scope);
+    restore_parse_state(&saved);
+
+    if ((ctx.ret.t & VT_BTYPE) == VT_VOID) {
+        vpushi(0);
+        vtop->type = ctx.ret;
+    } else
+        vset(&ctx.ret, VT_LOCAL | VT_LVAL, ctx.ret_loc);
+    return 1;
+}
+#endif
+
 static void unary(DiscardedExprContext *dctx)
 {
     int n, t, align, size, r;
@@ -3909,6 +4021,12 @@ tok_next:
 #endif
             s = external_global_sym(t, &func_old_type, 0);
         }
+#ifdef TCC_TARGET_816
+        /* a static inline function called: its body, here */
+        if ((s->type.t & (VT_STATIC | VT_INLINE | VT_BTYPE)) == (VT_STATIC | VT_INLINE | VT_FUNC) && tok == '('
+            && !nocode_wanted && inline_expand(s))
+            break;
+#endif
         if ((s->type.t & (VT_STATIC | VT_INLINE | VT_BTYPE)) == (VT_STATIC | VT_INLINE | VT_FUNC)) {
             /* if referencing an inline function, then we generate a
                symbol to it if not already done. It will have the
@@ -4695,6 +4813,24 @@ static void block_impl(int *bsym, int *csym, int *case_sym, int *def_sym, int ca
         }
         sym_pop(&local_stack, s);
         next();
+#ifdef TCC_TARGET_816
+    } else if (tok == TOK_RETURN && inline_ctx) {
+        /* a return in an expanded inline function: the value into its
+           result local, then to the end of the body */
+        next();
+        if (tok != ';') {
+            gexpr(NULL);
+            if ((inline_ctx->ret.t & VT_BTYPE) != VT_VOID) {
+                gen_assign_cast(&inline_ctx->ret);
+                vset(&inline_ctx->ret, VT_LOCAL | VT_LVAL, inline_ctx->ret_loc);
+                vswap();
+                vstore();
+            }
+            vpop();
+        }
+        skip(';');
+        inline_ctx->jumps = gjmp(inline_ctx->jumps);
+#endif
     } else if (tok == TOK_RETURN) {
         next();
         if (tok != ';') {
