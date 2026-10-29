@@ -1,2 +1,4 @@
 # scripts run under sh: keep LF whatever core.autocrlf says
 *.sh text eol=lf
+# the optimiser test inputs too: 816-opt reads lines up to the line feed
+*.ps text eol=lf

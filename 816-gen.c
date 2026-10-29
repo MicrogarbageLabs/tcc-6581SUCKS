@@ -268,6 +268,20 @@ void pr(const char *format, ...)
             const char *e = strchr(p, '\n');
             size_t n = e ? (size_t) (e - p) : strlen(p);
             int insn = (*p >= 'a' && *p <= 'z') && !(n && p[n - 1] == ':');
+            /* only the access itself: a move between A and a pseudo-register
+               ("sta.b tcc__r0") isn't one, and 816-opt's rules match those
+               lines exactly */
+            {
+                const char *op = memchr(p, ' ', n);
+                if (insn && op) {
+                    size_t on;
+                    while ((size_t) (op - p) < n && *op == ' ')
+                        op++;
+                    on = n - (size_t) (op - p);
+                    if (on >= 6 && !strncmp(op, "tcc__", 5) && !memchr(op, ',', on) && !memchr(op, ' ', on))
+                        insn = 0;
+                }
+            }
             if (o + n + 16 >= sizeof out)
                 break;
             memcpy(out + o, p, n);
@@ -472,133 +486,111 @@ static int fc_fits(CType *t)
     return type_size(t, &align) <= 2;
 }
 
-/* Locals in the direct page: tcc__l0..l3, callee-saved. Before a function
-   is compiled, dp_prescan looks over its body's tokens and picks up to
-   DP_MAX names used most inside loops (twice at least, never after a '&',
-   not called, not a member); the first declaration of each, if it's a
-   scalar of 2 bytes or less, lives in a slot: a VT_LOCAL lvalue at offset
-   DP_SLOT + 2 * k. A function saves the slots it used on entry and puts
-   them back on exit (__<fn>_dpu<k> / __<fn>_dps<k>, defined at its end),
-   so callees, recursion and the vblank callback (its own page) leave them
-   alone. The prescan only chooses: getting it wrong costs speed, not
-   correctness. */
+/* Locals in the direct page: tcc__l0..l3, callee-saved. Each function is
+   compiled twice (tccgen.c gen_function): a dry run with no code that
+   measures every local declared in it (its uses, weighted by loop depth:
+   1 outside a loop, 8 in one, 32 deeper; whether its address is taken; its
+   type), then the real one. The DP_MAX heaviest scalars of 2 bytes or less,
+   used at least twice in a loop and never with '&', live in slots in the
+   real pass: a VT_LOCAL lvalue at offset DP_SLOT + 2 * k. Declarations are
+   matched between the passes by their order, which is the same. A function
+   saves the slots it used on entry and puts them back on exit
+   (__<fn>_dpu<k> / __<fn>_dps<k>, defined at its end), so callees,
+   recursion and the vblank callback (its own page) leave them alone. */
 #define DP_SLOT 0x7E00
 #define DP_MAX 4
 #define DP_IS_SLOT(c) ((unsigned) (c) >= DP_SLOT && (unsigned) (c) < DP_SLOT + 2 * DP_MAX)
-static int dp_cand[DP_MAX];     /* the chosen names (token ids) */
-static int dp_ncand;
+int dry_run = 0;                /* compiling a function's dry run: measure, emit nothing that stays */
+int loop_depth = 0;             /* loops the parser is inside */
+static int dp_ncand;            /* slots chosen for the real pass */
+static int dp_chosen[DP_MAX];   /* their declarations, by order */
 static int dp_used[DP_MAX];     /* a declaration got the slot */
+static int dp_decls;            /* automatic locals declared so far in this pass */
 
-void dp_prescan(int *ids, int n)
+typedef struct {
+    Sym *sym;
+    int fits, weight, addr;
+} dp_stat_t;
+static dp_stat_t *dp_stat;
+static int dp_nstat, dp_capstat;
+
+/* before the dry run */
+void dp_dry_begin(void)
 {
-    int *depth = calloc(n + 1, sizeof *depth);
-    int *weight, i, k;
-    if (!depth)
-        error("out of memory");
+    dp_nstat = 0;
+    dp_decls = 0;
     dp_ncand = 0;
-    for (k = 0; k < DP_MAX; k++)
-        dp_used[k] = 0;
+}
 
-    /* the loops' extents: for/while from the keyword through the header
-       and the body (a block, or up to its ';'); do through its body */
-    for (i = 0; i < n; i++) {
-        int b, end = -1, lvl;
-        if (ids[i] != TOK_FOR && ids[i] != TOK_WHILE && ids[i] != TOK_DO)
-            continue;
-        b = i + 1;
-        if (ids[i] != TOK_DO) {
-            if (b >= n || ids[b] != '(')
-                continue;
-            for (lvl = 0; b < n; b++) {
-                if (ids[b] == '(')
-                    lvl++;
-                else if (ids[b] == ')' && --lvl == 0)
-                    break;
-            }
-            b++;
-        }
-        if (b >= n)
-            continue;
-        if (ids[b] == '{') {
-            for (lvl = 0, end = b; end < n; end++) {
-                if (ids[end] == '{')
-                    lvl++;
-                else if (ids[end] == '}' && --lvl == 0)
-                    break;
-            }
-        } else {
-            int par = 0, br = 0;
-            for (end = b; end < n; end++) {
-                if (ids[end] == '(')
-                    par++;
-                else if (ids[end] == ')')
-                    par--;
-                else if (ids[end] == '{')
-                    br++;
-                else if (ids[end] == '}')
-                    br--;
-                else if (ids[end] == ';' && par <= 0 && br <= 0)
-                    break;
-            }
-        }
-        depth[i]++;
-        if (end < n)
-            depth[end + 1]--;
+/* the dry run: an automatic local declared */
+void dp_note_decl(Sym *s, CType *type)
+{
+    if (dp_nstat == dp_capstat) {
+        dp_capstat = dp_capstat ? dp_capstat * 2 : 32;
+        dp_stat = realloc(dp_stat, dp_capstat * sizeof *dp_stat);
+        if (!dp_stat)
+            error("out of memory");
     }
-    for (i = 1; i < n; i++)
-        depth[i] += depth[i - 1];
+    dp_stat[dp_nstat].sym = s;
+    dp_stat[dp_nstat].fits = fc_fits(type) && !(type->t & VT_VOLATILE);
+    dp_stat[dp_nstat].weight = 0;
+    dp_stat[dp_nstat].addr = 0;
+    dp_nstat++;
+    dp_decls++;
+}
 
-    /* weigh each name: 1 outside a loop, 8 in one, 32 deeper */
-    weight = calloc(n, sizeof *weight);
-    if (!weight)
-        error("out of memory");
-    for (i = 0; i < n; i++) {
-        int t = ids[i], j, w, excluded = 0;
-        if (t < TOK_UIDENT)
-            continue;
-        if (i + 1 < n && ids[i + 1] == '(')
-            excluded = 1;                       /* a call */
-        if (i > 0 && (ids[i - 1] == '.' || ids[i - 1] == TOK_ARROW))
-            excluded = 1;                       /* a member */
-        for (j = i - 1; j >= 0 && ids[j] == '('; j--)
-            ;
-        if (j >= 0 && ids[j] == '&')
-            excluded = 2;                       /* its address, maybe */
-        w = depth[i] == 0 ? 1 : depth[i] == 1 ? 8 : 32;
-        for (j = 0; j < i; j++)
-            if (ids[j] == t)
-                break;
-        /* keep the totals on the name's first occurrence */
-        if (weight[j] >= 0)
-            weight[j] = excluded == 2 ? -1 : (excluded ? weight[j] : weight[j] + w);
-        if (excluded == 2)
-            weight[j] = -1;
-    }
-    /* the heaviest DP_MAX, 16 at least (two uses in a loop) */
+static dp_stat_t *dp_find(Sym *s)
+{
+    int i;
+    for (i = dp_nstat - 1; i >= 0; i--)
+        if (dp_stat[i].sym == s)
+            return &dp_stat[i];
+    return NULL;
+}
+
+/* the dry run: a local used, or its address taken */
+void dp_note_use(Sym *s)
+{
+    dp_stat_t *d = dp_find(s);
+    if (d)
+        d->weight += loop_depth == 0 ? 1 : loop_depth == 1 ? 8 : 32;
+}
+
+void dp_note_addr(Sym *s)
+{
+    dp_stat_t *d = dp_find(s);
+    if (d)
+        d->addr = 1;
+}
+
+/* between the passes: the heaviest DP_MAX, 16 at least */
+void dp_choose(void)
+{
+    int k, i;
+    dp_ncand = 0;
     for (k = 0; k < DP_MAX; k++) {
         int best = -1, bw = 15;
-        for (i = 0; i < n; i++)
-            if (weight[i] > bw) {
-                bw = weight[i];
+        for (i = 0; i < dp_nstat; i++)
+            if (dp_stat[i].fits && !dp_stat[i].addr && dp_stat[i].weight > bw) {
+                bw = dp_stat[i].weight;
                 best = i;
             }
         if (best < 0)
             break;
-        dp_cand[dp_ncand++] = ids[best];
-        weight[best] = 0;
+        dp_chosen[dp_ncand] = best;
+        dp_used[dp_ncand] = 0;
+        dp_ncand++;
+        dp_stat[best].weight = 0;
     }
-    free(depth);
-    free(weight);
+    dp_decls = 0;
 }
 
-/* the slot for a local being declared, or -1 */
-int dp_slot_for(int v, CType *type)
+/* the real pass: an automatic local declared; its slot, or -1 */
+int dp_take_slot(void)
 {
-    int k;
-    if (!fc_fits(type) || (type->t & VT_VOLATILE))
-        return -1;
+    int k, idx = dp_decls++;
     for (k = 0; k < dp_ncand; k++)
-        if (dp_cand[k] == (v & ~SYM_FIELD) && !dp_used[k]) {
+        if (dp_chosen[k] == idx) {
             dp_used[k] = 1;
             return k;
         }

@@ -511,7 +511,9 @@ void gaddrof(void)
     if ((vtop->r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && FC_IS_SLOT(vtop->c.ul))
         error("can't take the address of a fastcall parameter (copy it to a local)");
     if ((vtop->r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && DP_IS_SLOT(vtop->c.ul))
-        error("ICE: the address of a direct page local (the prescan missed a '&')");
+        error("ICE: the address of a direct page local (the dry run missed a '&')");
+    if (dry_run && (vtop->r & VT_VALMASK) == VT_LOCAL && vtop->sym)
+        dp_note_addr(vtop->sym);
 #endif
     vtop->r &= ~VT_LVAL;
     /* tricky: if saved lvalue, then we can go back to lvalue */
@@ -613,6 +615,14 @@ int gv(int rc)
         gen_op(TOK_SAR);
         r = gv(rc);
     } else {
+#ifdef TCC_TARGET_816
+        /* a function's dry run allocates nothing global: a float constant
+           (which would go in the data section) is an integer 0 there */
+        if (dry_run && is_float(vtop->type.t) && (vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST) {
+            vtop->type.t = VT_INT;
+            vtop->c.i = 0;
+        }
+#endif
         if (is_float(vtop->type.t) && (vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST) {
             Sym *sym;
             int *ptr;
@@ -3858,6 +3868,13 @@ tok_next:
                external reference to int() function */
             if (tcc_state->warn_implicit_function_declaration)
                 warning("implicit declaration of function '%s'", get_tok_str(t, NULL));
+#ifdef TCC_TARGET_816
+            /* the dry run must not declare it for good: the real pass
+               would then find it and not warn */
+            if (dry_run)
+                s = sym_push(t, &func_old_type, VT_CONST | VT_SYM, 0);
+            else
+#endif
             s = external_global_sym(t, &func_old_type, 0);
         }
         if ((s->type.t & (VT_STATIC | VT_INLINE | VT_BTYPE)) == (VT_STATIC | VT_INLINE | VT_FUNC)) {
@@ -3878,6 +3895,14 @@ tok_next:
             vtop->sym = s;
             vtop->c.ul = 0;
         }
+#ifdef TCC_TARGET_816
+        /* the dry run counts a local's uses, and keeps the symbol on the
+           value so a later '&' can be pinned on it (gaddrof) */
+        if (dry_run && (r & VT_VALMASK) == VT_LOCAL) {
+            dp_note_use(s);
+            vtop->sym = s;
+        }
+#endif
         break;
     }
 
@@ -4548,6 +4573,7 @@ static void block(int *bsym, int *csym, int *case_sym, int *def_sym, int case_re
             gsym(a);
     } else if (tok == TOK_WHILE) {
         next();
+        loop_depth++;
         d = ind;
         skip('(');
         gexpr(NULL);
@@ -4558,6 +4584,7 @@ static void block(int *bsym, int *csym, int *case_sym, int *def_sym, int case_re
         gjmp_addr(d);
         gsym(a);
         gsym_addr(b, d);
+        loop_depth--;
     } else if (tok == '{') {
         Sym *llabel;
 
@@ -4671,6 +4698,7 @@ static void block(int *bsym, int *csym, int *case_sym, int *def_sym, int case_re
     } else if (tok == TOK_FOR) {
         int e;
         next();
+        loop_depth++;
         skip('(');
         if (tok != ';') {
             DiscardedExprContext for_init_cand = {';'};
@@ -4750,8 +4778,10 @@ static void block(int *bsym, int *csym, int *case_sym, int *def_sym, int case_re
         gsym(a);
         gsym_addr(b, c);
 #endif
+        loop_depth--;
     } else if (tok == TOK_DO) {
         next();
+        loop_depth++;
         a = 0;
         b = 0;
         d = ind;
@@ -4765,6 +4795,7 @@ static void block(int *bsym, int *csym, int *case_sym, int *def_sym, int case_re
         skip(')');
         gsym(a);
         skip(';');
+        loop_depth--;
     } else if (tok == TOK_SWITCH) {
         next();
         skip('(');
@@ -5499,12 +5530,21 @@ static void decl_initializer_alloc(
     } else if (ad->packed) {
         align = 1;
     }
+#ifdef TCC_TARGET_816
+    /* an automatic local: counted in both passes, so the dry run's
+       measurements find their declarations in the real one */
+    int dp_auto = ((r & VT_VALMASK) == VT_LOCAL) && v;
+    /* the dry run allocates nothing global (strings, static locals): it
+       would be there twice; as locals they parse the same */
+    if (dry_run && (r & VT_VALMASK) == VT_CONST)
+        r = (r & ~(VT_VALMASK | VT_SYM)) | VT_LOCAL;
+#endif
     if ((r & VT_VALMASK) == VT_LOCAL) {
         sec = NULL;
 #ifdef TCC_TARGET_816
-        {
-            /* one of the locals dp_prescan chose: in a direct page slot */
-            int k = v ? dp_slot_for(v, type) : -1;
+        if (dp_auto && !dry_run) {
+            /* one the dry run chose: in a direct page slot */
+            int k = dp_take_slot();
             if (k >= 0) {
                 addr = DP_SLOT + 2 * k;
                 sym_push(v, type, r, addr);
@@ -5534,7 +5574,13 @@ static void decl_initializer_alloc(
 #endif
         if (v) {
             /* local variable */
+#ifdef TCC_TARGET_816
+            Sym *ns = sym_push(v, type, r, addr);
+            if (dp_auto && dry_run)
+                dp_note_decl(ns, type);
+#else
             sym_push(v, type, r, addr);
+#endif
         } else {
             /* push local reference */
             vset(type, r, addr);
@@ -5741,22 +5787,23 @@ static void gen_function(Sym *sym)
     sym_push2(&local_stack, SYM_FIELD, 0, 0);
 #ifdef TCC_TARGET_816
     {
-        /* the body's tokens first, for dp_prescan to choose the locals
-           that live in the direct page; then the body from them */
+        /* Each function twice: its body's tokens are kept, compiled once as
+           a dry run (no code that stays, nothing global allocated) that
+           measures its locals, everything that run changed is put back
+           then compiled for real with what it learned (which locals live
+           in the direct page). */
         TokenString body;
         ParseState saved;
-        int *ids = NULL, nids = 0, cap = 0, level = 0;
+        int level = 0;
+        int s_ind, s_jumps, s_labels, s_sc, s_scount, s_ibs, s_nocode;
+        Sym *s_local, *s_glabel;
+
         tok_str_new(&body);
         for (;;) {
             int t = tok;
             if (t == TOK_EOF || t < 0)
                 error("unexpected end of file in a function");
             tok_str_add_tok(&body);
-            if (nids == cap) {
-                cap = cap ? cap * 2 : 256;
-                ids = tcc_realloc(ids, cap * sizeof *ids);
-            }
-            ids[nids++] = t;
             next();
             if (t == '{')
                 level++;
@@ -5765,9 +5812,46 @@ static void gen_function(Sym *sym)
         }
         tok_str_add(&body, -1);
         tok_str_add(&body, 0);
-        dp_prescan(ids, nids);
-        tcc_free(ids);
         save_parse_state(&saved);
+
+        /* the dry run */
+        s_ind = ind;
+        s_jumps = jumps;
+        s_labels = labels;
+        s_sc = section_closed;
+        s_scount = section_count;
+        s_ibs = ind_before_section;
+        s_nocode = nocode_wanted;
+        s_local = local_stack;
+        s_glabel = global_label_stack;
+        dry_run = 1;
+        /* code is generated as in the real pass (the same paths, which
+           tcc's no-code mode is not: it's only ever used for sizeof), into
+           the text the rewind throws away */
+        loop_depth = 0;
+        dp_dry_begin();
+        macro_ptr = body.str;
+        next();
+        gfunc_prolog(&sym->type);
+        rsym = 0;
+        block(NULL, NULL, NULL, NULL, 0, 0);
+
+        /* put back what it changed */
+        sym_pop(&local_stack, s_local);
+        label_pop(&global_label_stack, s_glabel);
+        ind = s_ind;
+        jumps = s_jumps;
+        labels = s_labels;
+        label_workaround = NULL;
+        section_closed = s_sc;
+        section_count = s_scount;
+        ind_before_section = s_ibs;
+        nocode_wanted = s_nocode;
+        dry_run = 0;
+        loop_depth = 0;
+        dp_choose();
+
+        /* the real pass */
         macro_ptr = body.str;
         next();
         gfunc_prolog(&sym->type);

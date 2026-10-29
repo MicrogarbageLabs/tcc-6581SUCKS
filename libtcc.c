@@ -925,6 +925,10 @@ void warning(const char *fmt, ...)
 
     if (s1->warn_none)
         return;
+#ifdef TCC_TARGET_816
+    if (dry_run)
+        return;                 /* a function's dry run: the real pass warns */
+#endif
 
     va_start(ap, fmt);
     error1(s1, 1, fmt, ap);
