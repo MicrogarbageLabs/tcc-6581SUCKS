@@ -14,23 +14,56 @@ on that cart.
 
 ## How much faster
 
-Cycles for 64 passes of each pattern (`tests/cases/bench_core.c`), on the emulator:
+These are CPU cycles counted on the test emulator, which uses the 65816 datasheet's cycle counts.
+"PVSnesLib 4.5" is its stock 816-tcc and 816-opt. "This fork" is this compiler and its 816-opt,
+without `-mhx422`. Both builds give the same, checked answers. Lower is better.
 
-| Pattern | PVSnesLib 4.5 | This fork |
-|---|---:|---:|
-| `u16` global array, read: `arr16[i]` | 9230 | 2172 |
-| `u16` global array, write | 8078 | 1788 |
-| `u8` global array, read | 9358 | 2232 |
-| Struct array field: `act[i].x += act[i].dx` | 31886 | 2634 |
-| Pointer walk: `sum += *p++` | 11214 | 2806 |
-| A call with 3 `u16` args | 12430 | 7218 |
-| 32-bit add | 12686 | 7414 |
-| Local loop counter | 7118 | 1654 |
-| Global loop counter | 7118 | 2228 |
-| `u16` multiply | 16526 | 12594 (3958 with `-mhx422`) |
-| A fastcall with 3 `u16` args | 12430 | 6450 |
+### Loop bodies
 
-PVSnesLib's compiler has no fastcall, so its last row is the same call as the row above.
+64 passes of each pattern, inside one `for` loop in `main` (`tests/cases/bench_core.c`):
+
+| Pattern | PVSnesLib 4.5 | This fork | Speed-up |
+|---|---:|---:|---:|
+| `u16` global array, read: `sum += arr16[i]` | 9230 | 2172 | 4.2× |
+| `u16` global array, write: `arr16[i] = v` | 8078 | 1788 | 4.5× |
+| `u8` global array, read: `sum += arr8[i]` | 9358 | 2232 | 4.2× |
+| Struct array field: `act[i].x += act[i].dx` | 31886 | 2634 | 12.1× |
+| Pointer walk: `sum += *p++` | 11214 | 2806 | 4.0× |
+| A call with 3 `u16` args: `add3(a, b, c)` | 12430 | 7218 | 1.7× |
+| 32-bit add: `acc32 += v32` | 12686 | 7414 | 1.7× |
+| Local loop counter: `sum += l` | 7118 | 1654 | 4.3× |
+| Global loop counter: `sum += g` | 7118 | 2228 | 3.2× |
+| `u16` multiply: `a * b` | 16526 | 12594 | 1.3× |
+| A fastcall with 3 `u16` args | 12430 | 6450 | 1.9× |
+
+With `-mhx422`, the multiply row is 3958 (4.2×). PVSnesLib's compiler has no fastcall, so its last
+row is the same call as the row above it.
+
+### Whole functions
+
+One call to a small function, call and return included (`tests/cases/bench_more.c`):
+
+| Function | PVSnesLib 4.5 | This fork | Speed-up |
+|---|---:|---:|---:|
+| Copy 64 words: `while (n--) *d++ = *s++` | 12356 | 3498 | 3.5× |
+| Fill 64 words: `for (...) buf[i] = v` | 8985 | 2973 | 3.0× |
+| Sum 64 bytes through a pointer: `while (n--) t += *p++` | 9323 | 2985 | 3.1× |
+| 8×8 block into a 32×32 tile map: `map[(y0 + y) * 32 + x0 + x] = tile` | 15091 | 6537 | 2.3× |
+| Move 16 actors through a pointer: `p->x += p->dx; p->y += p->dy; p++` | 4570 | 3199 | 1.4× |
+| `switch` on 64 opcodes, 4 cases | 13541 | 5734 | 2.4× |
+| Clamp 64 signed values: `if (v > hi) v = hi; else if (v < lo) v = lo;` | 18900 | 8544 | 2.2× |
+| Count the set bits of 16 words: `while (x) { c += x & 1; x >>= 1; }` | 20998 | 8330 | 2.5× |
+| String length, 60 characters: `while (*s++) n++` | 8005 | 3049 | 2.6× |
+| Table lookup through an index, 64 times: `t += tab[idx[i]]` | 12714 | 4335 | 2.9× |
+| Divide 16 values by 10: `q += v[i] / 10` | 11119 | 9856 | 1.1× |
+| 16 steps of a fixed-point ease: `x += (target - x) >> 2` | 2107 | 1674 | 1.3× |
+| Recursive `fib(10)`, 177 calls | 25056 | 17102 | 1.5× |
+| Count 16 `u32` values over a limit: `if (big[i] > limit) c++` | 4906 | 3009 | 1.6× |
+
+Division still calls the library's divide routine, so that row barely moves.
+
+To reproduce, run `sh tests/run.sh bench_core bench_more`. For PVSnesLib's numbers, point `TCC=` and
+`OPT=` at its `816-tcc` and `816-opt`.
 
 ## What changed
 
