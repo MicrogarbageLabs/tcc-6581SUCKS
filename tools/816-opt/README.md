@@ -16,17 +16,37 @@ With those, its output matches PVSnesLib 4.5.0's binary on every file of the HX-
 compiler tests, apart from the empty-frame code 2.0 removes, which assembled to nothing.
 
 Added (`src/deadstore.c`, public domain), run after 2.0's passes and repeated with them until
-nothing changes. Both use liveness of the pseudo-registers over the whole file's control flow, not
-a few lines of straight code:
+nothing changes. They use liveness of the pseudo-registers over the whole file's control flow, not
+a few lines of straight code. Lines 816-tcc marks `; volatile` are never dropped, moved or reused.
 
-- **Dead stores:** a store to `tcc__rN` that no path reads goes.
-- **Operand forwarding:** a value parked in `tcc__rN` for one use goes straight to it:
-  `lda M / sta rN / lda … / adc rN` becomes `lda … / adc M` (also `sbc and ora eor cmp`; M
-  immediate, absolute, long or stack-relative, with no store, call, branch, width change, or stack
-  move for a stack M, in between); `sta rN / … / ldx rN` becomes `tax / …` (`ldy`: `tay`) when
-  nothing between uses the index or the flags; `stz rN / lda rN` becomes `lda.w #0`.
+- **Dead stores:** a store to `tcc__rN` that no path reads goes. So does a load of a
+  pseudo-register or slot that nothing reads.
+- **Operand forwarding:**
+  - A value parked in `tcc__rN` for one use goes straight to it: `lda M / sta rN / lda … / adc rN`
+    becomes `lda … / adc M` (also `sbc and ora eor cmp`). That needs no store, call, branch, width
+    change, or (for a stack M) stack move in between.
+  - `sta rN / … / ldx rN` becomes `tax / …` (`ldy`: `tay`).
+  - `stz rN / lda rN` becomes `lda.w #0`.
+  - `sta rN / lda M / clc / adc rN` becomes `clc / adc M`, since the operation is commutative
+    (also `and ora eor`).
+- **Known registers:** a load of what A, X or Y already holds goes. A load of what another register
+  holds becomes a transfer.
+- **Reused blocks:** a computation repeated from the same sources (an `act[i]` index worked out
+  twice) is done once.
+- **Unsigned byte loads:** `lda.w #0 / sep / lda M / rep` becomes `lda M / and.w #$00ff`, 8 cycles
+  instead of 13. It reads the byte after M too, so it only applies to named objects, never volatile
+  ones.
+- **Rules for 816-tcc's Y/X loops and direct-page pointers:**
+  - `iny`/`dey` and `cpy`, with the counter in Y.
+  - Shifts done in A.
+  - `while (n--)` as `dey / cpy.w #$ffff`.
+  - `[tcc__rN]` read as `[tcc__lK]` when `rN` is a copy of a slot pointer.
 
-`tests/cases/opt_forward.c` holds the cases where forwarding would be wrong.
+A rule may replace one line with two. `compact()` splits such a line before the next pass, which
+would otherwise see only its first instruction.
+
+`tests/cases/opt_forward.c`, `opt_known.c` and the loop cases hold the cases where a rule would be
+wrong.
 
 ```sh
 make            # needs PCRE2 (MSYS2: mingw-w64-x86_64-pcre2)
