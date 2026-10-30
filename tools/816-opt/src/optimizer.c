@@ -1083,7 +1083,10 @@ dynArray optimizeAsm(dynArray file, const dynArray bss, const size_t quietdisp)
             if (strlen(file.arr[i]) >= 6) {
                 char *ss_buffer = sliceStr(file.arr[i], 0, 6);
 
-                if (matchStr(ss_buffer, "lda.l ") || matchStr(ss_buffer, "sta.l ")) {
+                /* not w + -2,x (a w[i++], 816-gen.c xl_post): under -mcartram w
+                   can be at $0000, where only a long address doesn't wrap */
+                if ((matchStr(ss_buffer, "lda.l ") || matchStr(ss_buffer, "sta.l "))
+                    && !strstr(file.arr[i], "+ -")) {
                     size_t cont = 0;
                     char *ss_buffer2 = sliceStr(file.arr[i], 2, strlen(file.arr[i]));
 

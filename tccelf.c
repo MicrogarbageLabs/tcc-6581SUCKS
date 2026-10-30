@@ -1853,7 +1853,11 @@ static void tcc_output_binary(TCCState *s1, FILE *f, const int *section_order)
             int empty = 1;
             if (s1->hirom_comp || s1->fastrom_comp)
                 fprintf(f, ".BASE $00\n"); /* Return to base $00 */
-            fprintf(f, ".RAMSECTION \".bss\" BANK $7e SLOT 2\n");
+            if (s1->cartram)
+                /* -mcartram: into crt0's section in the cart RAM bank */
+                fprintf(f, ".RAMSECTION \".bss\" APPENDTO \"cartram.bss\"\n");
+            else
+                fprintf(f, ".RAMSECTION \".bss\" BANK $7e SLOT 2\n");
             for (j = 0, esym = (ElfW(Sym) *) symtab_section->data;
                  j < symtab_section->sh_size / sizeof(ElfW(Sym));
                  esym++, j++) {
@@ -1872,6 +1876,41 @@ static void tcc_output_binary(TCCState *s1, FILE *f, const int *section_order)
                 }
             }
 
+            fprintf(f, ".ENDS\n");
+        } else if (!strncmp(s->name, ".wram", 5)) {
+            /* __attribute__((section(".wram"))): kept in WRAM bank $7E
+               whatever -mcartram says (crt0 zeroes it), for what must be
+               there: HDMA tables, anything touched while a release has the
+               cart RAM. Reached long, like any symbol outside DB's bank. */
+            ElfW(Sym) * esym;
+            for (j = 0; j < s->data_offset; j++)
+                if (s->data[j])
+                    error("'%s': a .wram variable can't have an initial value (it starts zeroed)", s->name);
+            if (s1->hirom_comp || s1->fastrom_comp)
+                fprintf(f, ".BASE $00\n");
+            fprintf(f, ".RAMSECTION \"%s%s\" BANK $7e SLOT 2\n", unique_token, s->name);
+            {
+                /* the section's symbols in address order, gaps as dsb */
+                unsigned long at = 0;
+                for (;;) {
+                    ElfW(Sym) *best = NULL;
+                    for (j = 0, esym = (ElfW(Sym) *) symtab_section->data;
+                         j < symtab_section->sh_size / sizeof(ElfW(Sym)); esym++, j++)
+                        if (esym->st_shndx == s->sh_num && esym->st_value >= at
+                            && strlen(symtab_section->link->data + esym->st_name)
+                            && (!best || esym->st_value < best->st_value))
+                            best = esym;
+                    if (!best)
+                        break;
+                    if (best->st_value > at)
+                        fprintf(f, "dsb %lu\n", (unsigned long) best->st_value - at);
+                    fprintf(f, "%s dsb %lu\n", symtab_section->link->data + best->st_name,
+                            (unsigned long) (best->st_size ? best->st_size : 1));
+                    at = best->st_value + (best->st_size ? best->st_size : 1);
+                }
+                if (at < s->data_offset)
+                    fprintf(f, "dsb %lu\n", (unsigned long) s->data_offset - at);
+            }
             fprintf(f, ".ENDS\n");
         } else { /* .data, .rodata, user-defined sections */
 

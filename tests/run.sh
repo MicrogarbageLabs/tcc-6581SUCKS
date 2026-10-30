@@ -41,8 +41,12 @@ run_opt() {
 }
 [ -x "$TCC" ] || [ -x "$TCC.exe" ] || { echo "no $TCC: run make first"; exit 2; }
 gcc -O2 -Wall -o $B/run816 emu/run816.c emu/emu816.c || exit 2
-cp "$LIBTCC" $B/libtcc.obj
+# the helper routines (multiply, divide, ...): the fork's copy of PVSnesLib's
+# libtcc.asm (../lib816), fixed for -mcartram, assembled for this map
+"$WLA" -d -s -x -I rt -DHIROM -DFASTROM -o $B/libtcc.obj ../lib816/libtcc.asm >> $B/rt.log 2>&1 || { cat $B/rt.log; exit 2; }
 "$WLA" -d -s -x -I rt -o $B/crt0.obj rt/crt0.asm > $B/rt.log 2>&1 || { cat $B/rt.log; exit 2; }
+# the start-up for code compiled with -mcartram: globals in cart RAM, bank $C8
+"$WLA" -d -s -x -I rt -DCARTRAM=\$C8 -o $B/crt0_cart.obj rt/crt0.asm >> $B/rt.log 2>&1 || { cat $B/rt.log; exit 2; }
 "$WLA" -d -s -x -I rt -o $B/test.obj rt/test.asm >> $B/rt.log 2>&1 || { cat $B/rt.log; exit 2; }
 
 if [ $# -gt 0 ]; then cases="$*"; else cases=$(cd cases && ls *.c | sed 's/\.c$//'); fi
@@ -59,7 +63,9 @@ for n in $cases; do
         run_opt $B/$n.ps $B/$n.asp >> $log 2>&1 &&
         "$CTF" cases/$n.c $B/$n.asp $B/$n.asm >> $log 2>&1 &&
         "$WLA" -d -s -x -I rt -o $B/$n.obj $B/$n.asm >> $log 2>&1 &&
-        printf '[objects]\n%s\n%s\n%s\n%s\n' $B/crt0.obj $B/test.obj $B/$n.obj $B/libtcc.obj > $B/$n.link &&
+        crt0=$B/crt0.obj &&
+        case " $flags " in *" -mcartram"*) crt0=$B/crt0_cart.obj;; esac &&
+        printf '[objects]\n%s\n%s\n%s\n%s\n' $crt0 $B/test.obj $B/$n.obj $B/libtcc.obj > $B/$n.link &&
         "$LINK" -d -s -v -A -c $B/$n.link $B/$n.sfc >> $log 2>&1 || ok=0
     if [ $ok = 0 ]; then
         echo "$n: BUILD FAILED"

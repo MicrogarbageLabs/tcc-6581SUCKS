@@ -617,16 +617,19 @@ void dp_choose(void)
    (where the test and every break meet) Y goes back to the counter's home.
    A return inside needs nothing: the counter dies with the function.
 
-   And its index in X: in such a loop with no for loop inside, stepped by
-   ++ or --, the counter written by nothing but its increment, X holds
+   And its index in X: in such a loop with no loop inside, X holds
    counter * S for the whole loop, S the size of the elements it indexes
-   (one size per loop). The dry run speculates: a global array indexed by
+   (one size per loop). A while or do loop's counter isn't named by an
+   increment, so the first local to index a global is the candidate, and
+   yl_pick_hottest prefers it. The dry run speculates: a global array indexed by
    the counter (gen_op's pointer add) takes register TREG_XIV, "the index
    is in X", instead of computing counter * S into a register, so the
    access is lda.l arr,x with no ldx; the loop qualifies when its code then
    has no other X write. The real pass sets X before the test (tyx, or the
-   counter times S then ldx) and steps it by S after the increment's ldy. A
-   use of the scaled value as a number gets stx into a register. */
+   counter times S then ldx), and every store to the counter moves X too
+   (xl_after_store): by S for ++ and --, else from Y, which needs S a power
+   of 2 (a loop with such a write and any other S goes without). A use of
+   the scaled value as a number gets stx into a register. */
 #define YL_MAX 256
 #define TREG_XIV 8              /* a register no value is ever allocated: "in X" */
 typedef struct {
@@ -636,10 +639,10 @@ typedef struct {
     int parent, ok, gotos, chosen, child_chosen;
     int two;                    /* the counter is 2 bytes (read while its symbol lives) */
     int has_child;              /* a for loop inside */
-    int step;                   /* the increment: +1 (++), -1 (--), 0 (+= n: no X) */
     int scale;                  /* the element size X steps by, 0 none yet */
-    int cwrites;                /* writes to the counter besides the increment */
-    int test_stores[4], ntest;  /* locals the test writes (before the counter is known) */
+    int xc, xhas;               /* the local indexing, before a counter is known */
+    int cwrites;                /* writes to the counter other than ++ and -- */
+    int test_stores[8], ntest;  /* such writes before the counter is known */
     int xok, xchosen;
     Sym *us[8];                 /* locals used in it, and how often (a while loop's */
     int uc[8], nu;              /* counter: the most used, when no increment names one) */
@@ -653,8 +656,11 @@ static int yl_count;            /* for loops met so far in the real pass */
 int goto_seen;                  /* gotos and labels parsed: a loop's count must not move */
 static int yl_active, yl_c;     /* a counter in Y now, and its home's offset */
 static SValue yl_home;
-int yl_in_inc;                  /* the loop's increment is being compiled */
-static int xl_active, xl_scale, xl_step;  /* the index in X now: counter * scale, step */
+int xl_hint;                    /* inc() is storing: the step, +1 or -1 */
+int tok_count;                  /* tokens read, next() */
+int xl_idx_tok;                 /* tok_count at the first token inside a [ */
+static int xl_disp;             /* w[i++]: for the xl_index that follows */
+static int xl_active, xl_scale; /* the index in X now: counter * scale */
 
 void store(int r, SValue *sv);
 
@@ -696,35 +702,70 @@ static int text_writes_x(const char *p, const char *end)
 static int is_sym_addr(SValue *v);
 int xl_index(int u)
 {
-    int k;
+    int k, d = xl_disp;
+    xl_disp = 0;
     if (vtop->r != (VT_LOCAL | VT_LVAL) || !is_sym_addr(&vtop[-1]) || u <= 0)
         return 0;
     if (dry_run) {
-        if (!yl_sp || (k = yl_stack[yl_sp - 1]) < 0 || !yl[k].sym || !yl[k].two || !yl[k].step || yl[k].has_child
-            || vtop->c.ul != (unsigned long) yl[k].sym->c)
+        if (!yl_sp || (k = yl_stack[yl_sp - 1]) < 0 || yl[k].has_child)
+            return 0;
+        /* a while loop's counter isn't known yet: the first local indexing
+           is the candidate, another gets an ldx and rules X out */
+        if (yl[k].sym ? !yl[k].two || vtop->c.ul != (unsigned long) yl[k].sym->c
+                      : yl[k].xhas && (unsigned long) yl[k].xc != vtop->c.ul)
             return 0;
         if (yl[k].scale && yl[k].scale != u)
             return 0;           /* another size: the ldx it gets rules X out */
         yl[k].scale = u;
+        if (!yl[k].sym) {
+            yl[k].xhas = 1;
+            yl[k].xc = vtop->c.ul;
+        }
     } else if (!xl_active || vtop->c.ul != (unsigned long) yl_c || u != xl_scale)
         return 0;
+    vtop[-1].c.ul += d;
     vtop->r = TREG_XIV;
     vtop->type.t = VT_INT | VT_UNSIGNED;
     return 1;
 }
 
-/* the dry run: a store to a local; a write to the innermost loop's counter
-   that isn't its increment rules X out */
+/* inc(): i++ or i-- that is all of an index, w[i++] (gen_op's add comes
+   next: nothing but those 3 tokens since the [). X and Y step now and the
+   access is w - 2,x, so the step can't be separated from a value still on
+   the stack, as in w[i++] = a ? b : c. 1 if done, the value being i. */
+int xl_post(int dir)
+{
+    int u;
+    if (nocode_wanted || tok != ']' || tok_count != xl_idx_tok + 2 || vtop->r != (VT_LOCAL | VT_LVAL)
+        || !is_sym_addr(&vtop[-1]) || (u = pointed_size(&vtop[-1].type)) <= 0)
+        return 0;
+    if (dry_run ? !yl_sp || yl_stack[yl_sp - 1] < 0
+                : !xl_active || vtop->c.ul != (unsigned long) yl_c || u != xl_scale)
+        return 0;
+    vdup();                     /* i, for the index */
+    vdup();
+    vpushi(dir);
+    gen_op('+');
+    xl_hint = dir;
+    vstore();
+    xl_hint = 0;
+    vpop();
+    xl_disp = -dir * u;
+    return 1;
+}
+
+/* the dry run: a store to a local, not a ++ or --: on the innermost loop's
+   counter, X can follow it only by shifting */
 static void yl_note_store(SValue *sv)
 {
     int k;
-    if (!dry_run || yl_in_inc || !yl_sp || (k = yl_stack[yl_sp - 1]) < 0
+    if (!dry_run || xl_hint || !yl_sp || (k = yl_stack[yl_sp - 1]) < 0
         || (sv->r & (VT_VALMASK | VT_LVAL)) != (VT_LOCAL | VT_LVAL))
         return;
     if (yl[k].sym) {
         if (sv->c.ul == (unsigned long) yl[k].sym->c)
             yl[k].cwrites++;
-    } else if (yl[k].ntest < 4)
+    } else if (yl[k].ntest < 8)
         yl[k].test_stores[yl[k].ntest++] = sv->c.ul;
     else
         yl[k].cwrites++;        /* too many to tell */
@@ -742,14 +783,24 @@ void yl_asm_clobbers(int x, int y)
         }
 }
 
-/* the real pass: X steps with the counter, after the increment's ldy */
+/* the real pass: any store to the counter, after its ldy: X follows, by
+   the step for ++ and --, else from Y (xok: the scale is then a power of 2) */
 static void xl_after_store(void)
 {
     int n, i;
-    if (!xl_active || !yl_in_inc)
+    if (!xl_active)
         return;
-    n = xl_scale * xl_step;
-    if (n >= -3 && n <= 3)
+    n = xl_scale * xl_hint;
+    if (!n) {
+        if (xl_scale == 1) {
+            pr("tyx\n");
+            return;
+        }
+        pr("tya\n");
+        for (i = xl_scale; i > 1; i >>= 1)
+            pr("asl a\n");
+        pr("tax\n");
+    } else if (n >= -3 && n <= 3)
         for (i = 0; i < (n < 0 ? -n : n); i++)
             pr(n < 0 ? "dex\n" : "inx\n");
     else
@@ -803,25 +854,33 @@ static void yl_note_use(Sym *s)
 }
 
 /* the dry run, at a loop's end with no counter named by an increment (a
-   while or do loop, or a for loop without one): its most used local still
-   in scope, a 2-byte automatic one used at least twice */
+   while or do loop, or a for loop without one): the local indexing a global
+   if there is one (it can go in X too), else the most used; still in scope,
+   a 2-byte automatic one used at least twice */
 static void yl_pick_hottest(int k)
 {
     int j, best = -1, bc = 1;
     for (j = 0; j < yl[k].nu; j++) {
         Sym *s = yl[k].us[j];
-        int align;
-        if (yl[k].uc[j] <= bc || sym_find(s->v) != s || (s->r & (VT_VALMASK | VT_LVAL)) != (VT_LOCAL | VT_LVAL)
+        int align, c = yl[k].uc[j];
+        if (c < 2 || sym_find(s->v) != s || (s->r & (VT_VALMASK | VT_LVAL)) != (VT_LOCAL | VT_LVAL)
             || is_float(s->type.t) || (s->type.t & VT_BTYPE) == VT_PTR || type_size(&s->type, &align) != 2)
             continue;
+        if (yl[k].xhas && yl[k].xc == s->c)
+            c += 0x4000;
+        if (c <= bc)
+            continue;
         best = j;
-        bc = yl[k].uc[j];
+        bc = c;
     }
     if (best < 0)
         return;
     yl[k].sym = yl[k].us[best];
     yl[k].tok = yl[k].sym->v;
     yl[k].two = 1;
+    for (j = 0; j < yl[k].ntest; j++)
+        if (yl[k].test_stores[j] == yl[k].sym->c)
+            yl[k].cwrites++;
 }
 
 /* a loop begins: a for loop before its test, a while loop before its test,
@@ -875,7 +934,6 @@ void yl_loop_begin(void)
                     }
                     xl_active = 1;
                     xl_scale = yl[k].scale;
-                    xl_step = yl[k].step;
                 }
             }
         }
@@ -903,10 +961,6 @@ void yl_loop_inc(int *ids, int n)
     {
         int align, j;
         yl[k].two = type_size(&s->type, &align) == 2 && !is_float(s->type.t);
-        if (ids[1] == TOK_INC || ids[0] == TOK_INC)
-            yl[k].step = 1;
-        else if (ids[1] == TOK_DEC || ids[0] == TOK_DEC)
-            yl[k].step = -1;
         for (j = 0; j < yl[k].ntest; j++)
             if (yl[k].test_stores[j] == s->c)
                 yl[k].cwrites++;  /* the test wrote it */
@@ -931,7 +985,9 @@ void yl_loop_end(void)
         yl[k].ok = yl[k].tok && goto_seen == yl[k].gotos && !yl[k].asm_y
                    && !text_uses_y((char *) cur_text_section->data + yl[k].start,
                                    (char *) cur_text_section->data + yl[k].end);
-        yl[k].xok = yl[k].ok && yl[k].scale && yl[k].step && !yl[k].has_child && !yl[k].cwrites && !yl[k].asm_x
+        yl[k].xok = yl[k].ok && yl[k].scale && !yl[k].has_child && !yl[k].asm_x
+                    && (!yl[k].xhas || (unsigned long) yl[k].xc == (unsigned long) yl[k].sym->c)
+                    && (!yl[k].cwrites || (yl[k].scale <= 16 && !(yl[k].scale & (yl[k].scale - 1))))
                     && !text_writes_x((char *) cur_text_section->data + yl[k].start,
                                       (char *) cur_text_section->data + yl[k].end);
         if (yl_norder < YL_MAX)
@@ -1080,6 +1136,30 @@ static void fc_operand(char *buf, size_t n, int k)
    wrapped in it: the same for any index inside a C array. */
 #define VT_IDXSYM VT_BOUNDED
 
+/* -mcartram: a global reached DB-relative (.w), not long (.l). DB is the
+   cart RAM bank, where every global this file defines and doesn't make
+   const lives (.bss and the data section's RAM copy). An extern may be
+   anywhere (WRAM, if assembly defines it), and const data is in ROM, so
+   they stay long. */
+static int near_sym(Sym *s)
+{
+    ElfW(Sym) * esym;
+    CType *t;
+    if (!tcc_state->cartram || !s || (s->v & ~SYM_FIELD) >= SYM_FIRST_ANOM || !s->c)
+        return 0;
+    for (t = &s->type; t; t = (t->t & VT_ARRAY) ? &t->ref->type : NULL) {
+        if (t->t & VT_CONSTANT)
+            return 0;
+        if (!(t->t & VT_ARRAY))
+            break;
+    }
+    if ((s->type.t & VT_BTYPE) == VT_FUNC)
+        return 0;
+    esym = &((ElfW(Sym) *) symtab_section->data)[s->c];
+    return esym->st_shndx == SHN_COMMON || esym->st_shndx == bss_section->sh_num
+           || esym->st_shndx == data_section->sh_num;
+}
+
 static int is_idx(SValue *v)
 {
     return (v->r & VT_IDXSYM) && (v->r & VT_VALMASK) < VT_CONST;
@@ -1178,6 +1258,9 @@ static void load_impl(int r, SValue *sv)
     }
     if (is_idx(sv)) {
         char *sy = get_sym_str(sv->sym);
+        /* -mcartram: DB-relative, but not below the symbol (w[i++]: long,
+           where w - 2,x can't wrap at the start of the bank) */
+        int lsz = near_sym(sv->sym) && (int) fc >= 0 ? 'w' : 'l';
         if (!(fr & VT_LVAL)) {      /* the address */
             idx_to_ptr(r, sv);
             return;
@@ -1189,22 +1272,22 @@ static void load_impl(int r, SValue *sv)
         if (is_float(ft)) {
             if (length != 4)
                 error("ICE idx float");
-            pr("lda.l %s + %d,x\nsta.b tcc__f%d\nlda.l %s + %d + 2,x\nsta.b tcc__f%dh\n",
-               sy, fc, r - TREG_F0, sy, fc, r - TREG_F0);
+            pr("lda.%c %s + %d,x\nsta.b tcc__f%d\nlda.%c %s + %d + 2,x\nsta.b tcc__f%dh\n",
+               lsz, sy, fc, r - TREG_F0, lsz, sy, fc, r - TREG_F0);
             return;
         }
         switch (length) {
         case 1:
-            pr("lda.w #0\nsep #$20\nlda.l %s + %d,x\nrep #$20\n", sy, fc);
+            pr("lda.w #0\nsep #$20\nlda.%c %s + %d,x\nrep #$20\n", lsz, sy, fc);
             if (!(ft & VT_UNSIGNED))
                 pr("xba\nxba\nbpl +\nora.w #$ff00\n+\n");
             pr("sta.b tcc__r%d\n", r);
             break;
         case 2:
-            pr("lda.l %s + %d,x\nsta.b tcc__r%d\n", sy, fc, r);
+            pr("lda.%c %s + %d,x\nsta.b tcc__r%d\n", lsz, sy, fc, r);
             break;
         case 4:
-            pr("lda.l %s + %d,x\nsta.b tcc__r%d\nlda.l %s + %d + 2,x\nsta.b tcc__r%dh\n", sy, fc, r, sy, fc, r);
+            pr("lda.%c %s + %d,x\nsta.b tcc__r%d\nlda.%c %s + %d + 2,x\nsta.b tcc__r%dh\n", lsz, sy, fc, r, lsz, sy, fc, r);
             break;
         default:
             error("ICE idx load %d", length);
@@ -1255,15 +1338,16 @@ static void load_impl(int r, SValue *sv)
         } else if (v == VT_CONST) {
             if (fr & VT_SYM) { // deref symbol + displacement
                 char *sy = get_sym_str(sv->sym);
+                int lsz = near_sym(sv->sym) ? 'w' : 'l';   /* -mcartram: DB-relative */
                 if (is_float(ft)) {
                     pr("; fld%d [%s + %d], tcc__f%d\n", length, sy, fc, r - TREG_F0);
                     switch (length) {
                     case 4:
-                        pr("lda.l %s + %d\nsta.b tcc__f%d\nlda.l %s + %d + 2\nsta.b tcc__f%dh\n",
-                           sy,
+                        pr("lda.%c %s + %d\nsta.b tcc__f%d\nlda.%c %s + %d + 2\nsta.b tcc__f%dh\n",
+                           lsz, sy,
                            fc,
                            r - TREG_F0,
-                           sy,
+                           lsz, sy,
                            fc,
                            r - TREG_F0);
                         break;
@@ -1278,20 +1362,20 @@ static void load_impl(int r, SValue *sv)
                         warning("large index %d may cross bank boundary", fc);
                     switch (length) {
                     case 1:
-                        pr("lda.w #0\nsep #$20\nlda.l %s + %d\nrep #$20\n", sy, fc);
+                        pr("lda.w #0\nsep #$20\nlda.%c %s + %d\nrep #$20\n", lsz, sy, fc);
                         if (!(ft & VT_UNSIGNED))
                             pr("xba\nxba\nbpl +\nora.w #$ff00\n+\n");
                         pr("sta.b tcc__r%d\n", r);
                         break;
                     case 2:
-                        pr("lda.l %s + %d\nsta.b tcc__r%d\n", sy, fc, r);
+                        pr("lda.%c %s + %d\nsta.b tcc__r%d\n", lsz, sy, fc, r);
                         break;
                     case 4:
-                        pr("lda.l %s + %d\nsta.b tcc__r%d\nlda.l %s + %d + 2\nsta.b tcc__r%dh\n",
-                           sy,
+                        pr("lda.%c %s + %d\nsta.b tcc__r%d\nlda.%c %s + %d + 2\nsta.b tcc__r%dh\n",
+                           lsz, sy,
                            fc,
                            r,
-                           sy,
+                           lsz, sy,
                            fc,
                            r);
                         break;
@@ -1567,21 +1651,22 @@ static void store_impl(int r, SValue *sv)
     yl_note_store(sv);
     if (is_idx(sv) && (fr & VT_LVAL)) {     /* an indexed global's element */
         char *sy = get_sym_str(sv->sym);
+        int lsz = near_sym(sv->sym) && (int) fc >= 0 ? 'w' : 'l';   /* as in load */
         if ((fr & VT_VALMASK) != TREG_XIV)
             pr("ldx.b tcc__r%d\n", fr & VT_VALMASK);
         switch (length) {
         case 1:
-            pr("sep #$20\nlda.b tcc__r%d\nsta.l %s + %d,x\nrep #$20\n", r, sy, fc);
+            pr("sep #$20\nlda.b tcc__r%d\nsta.%c %s + %d,x\nrep #$20\n", r, lsz, sy, fc);
             break;
         case 2:
-            pr("lda.b tcc__r%d\nsta.l %s + %d,x\n", r, sy, fc);
+            pr("lda.b tcc__r%d\nsta.%c %s + %d,x\n", r, lsz, sy, fc);
             break;
         case 4:
             if (r >= TREG_F0)
-                pr("lda.b tcc__f%d\nsta.l %s + %d,x\nlda.b tcc__f%dh\nsta.l %s + %d + 2,x\n",
-                   r - TREG_F0, sy, fc, r - TREG_F0, sy, fc);
+                pr("lda.b tcc__f%d\nsta.%c %s + %d,x\nlda.b tcc__f%dh\nsta.%c %s + %d + 2,x\n",
+                   r - TREG_F0, lsz, sy, fc, r - TREG_F0, lsz, sy, fc);
             else
-                pr("lda.b tcc__r%d\nsta.l %s + %d,x\nlda.b tcc__r%dh\nsta.l %s + %d + 2,x\n", r, sy, fc, r, sy, fc);
+                pr("lda.b tcc__r%d\nsta.%c %s + %d,x\nlda.b tcc__r%dh\nsta.%c %s + %d + 2,x\n", r, lsz, sy, fc, r, lsz, sy, fc);
             break;
         default:
             error("ICE idx store %d", length);
@@ -1624,6 +1709,7 @@ static void store_impl(int r, SValue *sv)
         if (v == VT_CONST) {
             if (fr & VT_SYM) { // deref symbol
                 char *sy = get_sym_str(sv->sym);
+                int lsz = near_sym(sv->sym) ? 'w' : 'l';   /* -mcartram: DB-relative */
                 if (r >= TREG_F0)
                     pr("; fst%d tcc__f%d, [%s,%d]\n", length, r - TREG_F0, sy, fc);
                 else
@@ -1632,27 +1718,27 @@ static void store_impl(int r, SValue *sv)
                     error("illegal float store of length %d", length);
                 switch (length) {
                 case 1:
-                    pr("sep #$20\nlda.b tcc__r%d\nsta.l %s + %d\nrep #$20\n", r, sy, fc);
+                    pr("sep #$20\nlda.b tcc__r%d\nsta.%c %s + %d\nrep #$20\n", r, lsz, sy, fc);
                     break;
                 case 2:
-                    pr("lda.b tcc__r%d\nsta.l %s + %d\n", r, sy, fc);
+                    pr("lda.b tcc__r%d\nsta.%c %s + %d\n", r, lsz, sy, fc);
                     break;
                 case 4:
                     if (r >= TREG_F0)
-                        pr("lda.b tcc__f%d\nsta.l %s + %d\nlda.b tcc__f%dh\nsta.l %s + %d + 2\n",
+                        pr("lda.b tcc__f%d\nsta.%c %s + %d\nlda.b tcc__f%dh\nsta.%c %s + %d + 2\n",
                            r - TREG_F0,
-                           sy,
+                           lsz, sy,
                            fc,
                            r - TREG_F0,
-                           sy,
+                           lsz, sy,
                            fc);
                     else
-                        pr("lda.b tcc__r%d\nsta.l %s + %d\nlda.b tcc__r%dh\nsta.l %s + %d + 2\n",
+                        pr("lda.b tcc__r%d\nsta.%c %s + %d\nlda.b tcc__r%dh\nsta.%c %s + %d + 2\n",
                            r,
-                           sy,
+                           lsz, sy,
                            fc,
                            r,
-                           sy,
+                           lsz, sy,
                            fc);
                     break;
                 default:

@@ -67,8 +67,19 @@ tcc__l3 dsb 2                           ; the page is 64 bytes: the vblank callb
 
 ; Initialised globals live in ROM ("glob.data") and are copied to WRAM
 ; ("globram.data") at start-up. Both sections must exist even when empty.
+; Assembled with -DCARTRAM=$C8 (for code compiled with -mcartram), both
+; the copy and .bss are in that cart RAM bank instead (slot 3 is any bank's
+; $0000-$FFFF: the memory map must match PVSnesLib's libtcc.obj), and DB
+; points there.
+.IFDEF CARTRAM
+.RAMSECTION "globram.data" BANK CARTRAM SLOT 3 KEEP
+.ENDS
+.RAMSECTION "cartram.bss" BANK CARTRAM SLOT 3 KEEP
+.ENDS
+.ELSE
 .RAMSECTION "globram.data" BANK $7f SLOT 3 KEEP
 .ENDS
+.ENDIF
 
 .BANK 0
 .BASE $C0
@@ -98,14 +109,10 @@ t_fast:
         lda.w #tcc__registers
         tad                             ; direct page = the tcc register page
 
+.IFNDEF CARTRAM
         ; copy initialised globals from ROM to WRAM
-        ldx #0
--       lda.l SECTIONSTART_glob.data,x
-        sta.l SECTIONSTART_globram.data,x
-        inx
-        inx
-        cpx #(SECTIONEND_glob.data-SECTIONSTART_glob.data)
-        bcc -
+        jsr copy_globals
+.ENDIF
 
         ; clear .bss: all of $7E:2000-$FFFF (each C object has its own .bss
         ; section, so the SECTIONSTART_/SECTIONEND_ names cover only one)
@@ -117,6 +124,20 @@ t_fast:
         dex
         stz.w $2000, x
         bne -
+
+.IFDEF CARTRAM
+        ; -mcartram: DB = the cart RAM bank, all of it cleared (.bss), then
+        ; the initialised globals copied in
+        pea (CARTRAM << 8) | CARTRAM
+        plb
+        plb
+        ldx #0
+-       stz.w $0000, x
+        inx
+        inx
+        bne -
+        jsr copy_globals
+.ENDIF
 
         ; the stubs memcpy and memmove call
         lda #$0054                      ; mvn + first byte
@@ -134,4 +155,25 @@ t_fast:
         jsl main
         jsl t_done                      ; never returns
 
+
+; copy the initialised globals, glob.data (ROM) to globram.data, byte by
+; byte and only as many as there are. The old word loop copied 2 bytes
+; even when there were none, and one past an odd count: with cart RAM,
+; where globram.data starts where .bss does, that put ROM bytes in the
+; first .bss variable after it was cleared (T2's errs read $C208). Last in
+; the section: its .accu directives must not change how the code after it
+; assembles (hx_snesinit's lda #imm is 8 bit).
+copy_globals:
+        sep #$20
+.accu 8
+        ldx #0
+        bra ++
+-       lda.l SECTIONSTART_glob.data,x
+        sta.l SECTIONSTART_globram.data,x
+        inx
+++      cpx #(SECTIONEND_glob.data-SECTIONSTART_glob.data)
+        bcc -
+        rep #$20
+.accu 16
+        rts
 .ENDS

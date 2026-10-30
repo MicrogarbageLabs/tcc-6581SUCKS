@@ -2715,6 +2715,9 @@ void inc(int post, int c, int preserve_old_value)
     /* a direct page pointer's p++: the step waits for the sequence point */
     if (post && preserve_old_value && dp_pend_post(c == TOK_INC ? 1 : -1))
         return;
+    /* the X loop's counter as a whole index: the access makes up the step */
+    if (post && preserve_old_value && xl_post(c == TOK_INC ? 1 : -1))
+        return;
 #endif
     vdup(); /* save lvalue */
     if (post && preserve_old_value) {
@@ -2725,7 +2728,13 @@ void inc(int post, int c, int preserve_old_value)
     /* add constant */
     vpushi(c - TOK_MID);
     gen_op('+');
+#ifdef TCC_TARGET_816
+    xl_hint = c - TOK_MID;      /* if it's the X loop's counter, X steps */
+#endif
     vstore(); /* store value */
+#ifdef TCC_TARGET_816
+    xl_hint = 0;
+#endif
     if (post && preserve_old_value)
         vpop(); /* if post op, return saved value */
 }
@@ -4105,6 +4114,9 @@ tok_next:
             next();
         } else if (tok == '[') {
             next();
+#ifdef TCC_TARGET_816
+            xl_idx_tok = tok_count;
+#endif
             gexpr(NULL);
             gen_op('+');
             indir();
@@ -4951,10 +4963,8 @@ static void block_impl(int *bsym, int *csym, int *case_sym, int *def_sym, int ca
             next();
             {
                 DiscardedExprContext for_incr_cand = {')'};
-                yl_in_inc = 1;              /* its store steps X too */
                 gexpr(&for_incr_cand);
                 vpop();
-                yl_in_inc = 0;
             }
             skip(')');
             restore_parse_state(&saved);

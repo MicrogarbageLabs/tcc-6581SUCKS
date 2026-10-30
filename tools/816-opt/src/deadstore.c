@@ -724,25 +724,32 @@ size_t forwardOperands(dynArray *file)
              sty rA / tya / sta rB / clc / lda rA / adc.w #65535 / tay /
              lda rB / bne L         ->  dey / cpy.w #65535 / bne L
            (beq too): Z was old == 0, and is now new == $FFFF, the same;
-           rA and rB dead after */
+           rA and rB dead after. An index in X steps down between the tay
+           and the lda (dex, or txa / clc / adc / tax): that stays, before
+           the cpy. */
         if (is(a, "sty") && i + 8 < F.n && !a->x8 && !a->m8) {
             int ra = stored_reg(a), rb = stored_reg(&F.L[i + 2]);
-            line_t *br = &F.L[i + 8];
-            size_t u;
-            int ok = ra >= 0 && rb >= 0 && ra != rb && is(&F.L[i + 1], "tya") && is(&F.L[i + 2], "sta")
-                     && is(&F.L[i + 3], "clc") && reg_operand(&F.L[i + 4], "lda") == ra && is(&F.L[i + 5], "adc")
-                     && !strcmp(F.L[i + 5].op, "#65535") && is(&F.L[i + 6], "tay")
-                     && reg_operand(&F.L[i + 7], "lda") == rb && (is(br, "bne") || is(br, "beq"))
-                     && !((F.out[i + 8] >> ra) & 1) && !((F.out[i + 8] >> rb) & 1);
-            for (u = i + 1; ok && u <= i + 8; u++)
+            size_t u, s = i + 7;
+            line_t *br;
+            int ok;
+            while (s + 1 < F.n && (is(&F.L[s], "dex") || is(&F.L[s], "txa") || is(&F.L[s], "clc")
+                                   || (is(&F.L[s], "adc") && F.L[s].op[0] == '#') || is(&F.L[s], "tax")))
+                s++;
+            br = &F.L[s + 1 < F.n ? s + 1 : s];
+            ok = ra >= 0 && rb >= 0 && ra != rb && s + 1 < F.n && is(&F.L[i + 1], "tya") && is(&F.L[i + 2], "sta")
+                 && is(&F.L[i + 3], "clc") && reg_operand(&F.L[i + 4], "lda") == ra && is(&F.L[i + 5], "adc")
+                 && !strcmp(F.L[i + 5].op, "#65535") && is(&F.L[i + 6], "tay")
+                 && reg_operand(&F.L[s], "lda") == rb && (is(br, "bne") || is(br, "beq"))
+                 && !((F.out[s + 1] >> ra) & 1) && !((F.out[s + 1] >> rb) & 1);
+            for (u = i + 1; ok && u <= s + 1; u++)
                 if (gone[u] || F.L[u].labelled)
                     ok = 0;
             if (ok) {
                 replace_line(file, i, "dey");
-                replace_line(file, i + 1, "cpy.w #65535");
-                for (u = i + 2; u <= i + 7; u++)
+                for (u = i + 1; u <= i + 6; u++)
                     drop_line(file, u);
-                for (u = i; u <= i + 8; u++)
+                replace_line(file, s, "cpy.w #65535");
+                for (u = i; u <= s + 1; u++)
                     gone[u] = 1;
                 done++;
                 continue;
@@ -861,6 +868,34 @@ size_t forwardOperands(dynArray *file)
                 drop_line(file, i);
                 drop_line(file, i + 1);
                 gone[i] = gone[i + 1] = gone[u] = 1;
+                done++;
+                continue;
+            }
+        }
+
+        /* a compare's right side parked in a register:
+             sty rA / lda M / sta rB / lda rA / cmp rB  ->  tya / cmp M
+           (sta rA: just cmp M), rA and rB dead after */
+        r = stored_reg(a);
+        if (r >= 0 && r < 32 && !(r & 1) && (is(a, "sty") || is(a, "sta")) && !a->x8 && !a->m8 && i + 4 < F.n
+            && !gone[i + 1] && !gone[i + 2] && !gone[i + 3] && !gone[i + 4]) {
+            line_t *m = &F.L[i + 1], *c = &F.L[i + 4];
+            int rb = stored_reg(&F.L[i + 2]);
+            if (is(m, "lda") && m->op[0] && !m->vol && !m->keep && !m->m8 && !m->labelled && rb >= 0 && rb < 32
+                && !(rb & 1) && rb != r && is(&F.L[i + 2], "sta") && !F.L[i + 2].labelled
+                && reg_operand(&F.L[i + 3], "lda") == r && !F.L[i + 3].labelled && !F.L[i + 3].keep
+                && reg_operand(c, "cmp") == rb && !c->labelled && !c->keep && !mentions_reg(F.code[i + 1], r)
+                && !mentions_reg(F.code[i + 1], rb) && !((F.out[i + 4] >> r) & 1) && !((F.out[i + 4] >> rb) & 1)) {
+                snprintf(buf, sizeof buf, "cmp%s", m->rest);
+                if (is(a, "sty"))
+                    replace_line(file, i, "tya");
+                else
+                    drop_line(file, i);
+                drop_line(file, i + 1);
+                drop_line(file, i + 2);
+                drop_line(file, i + 3);
+                replace_line(file, i + 4, buf);
+                gone[i] = gone[i + 1] = gone[i + 2] = gone[i + 3] = gone[i + 4] = 1;
                 done++;
                 continue;
             }

@@ -46,23 +46,37 @@ One call to a small function, call and return included (`tests/cases/bench_more.
 | Function | PVSnesLib 4.5 | This fork | Speed-up |
 |---|---:|---:|---:|
 | Copy 64 words: `while (n--) *d++ = *s++` | 12356 | 3498 | 3.5× |
-| Fill 64 words: `for (...) buf[i] = v` | 8985 | 2973 | 3.0× |
+| Fill 64 words: `for (...) buf[i] = v` | 8985 | 2063 | 4.4× |
 | Sum 64 bytes through a pointer: `while (n--) t += *p++` | 9323 | 2985 | 3.1× |
 | 8×8 block into a 32×32 tile map: `map[(y0 + y) * 32 + x0 + x] = tile` | 15091 | 6537 | 2.3× |
 | Move 16 actors through a pointer: `p->x += p->dx; p->y += p->dy; p++` | 4570 | 3199 | 1.4× |
-| `switch` on 64 opcodes, 4 cases | 13541 | 5734 | 2.4× |
-| Clamp 64 signed values: `if (v > hi) v = hi; else if (v < lo) v = lo;` | 18900 | 8544 | 2.2× |
-| Count the set bits of 16 words: `while (x) { c += x & 1; x >>= 1; }` | 20998 | 8330 | 2.5× |
+| `switch` on 64 opcodes, 4 cases | 13541 | 4824 | 2.8× |
+| Clamp 64 signed values: `if (v > hi) v = hi; else if (v < lo) v = lo;` | 18900 | 7634 | 2.5× |
+| Count the set bits of 16 words: `while (x) { c += x & 1; x >>= 1; }` | 20998 | 7994 | 2.6× |
 | String length, 60 characters: `while (*s++) n++` | 8005 | 3049 | 2.6× |
-| Table lookup through an index, 64 times: `t += tab[idx[i]]` | 12714 | 4335 | 2.9× |
-| Divide 16 values by 10: `q += v[i] / 10` | 11119 | 9856 | 1.1× |
+| Table lookup through an index, 64 times: `t += tab[idx[i]]` | 12714 | 3425 | 3.7× |
+| Divide 16 values by 10: `q += v[i] / 10` | 11119 | 9312 | 1.2× |
 | 16 steps of a fixed-point ease: `x += (target - x) >> 2` | 2107 | 1674 | 1.3× |
 | Recursive `fib(10)`, 177 calls | 25056 | 17102 | 1.5× |
-| Count 16 `u32` values over a limit: `if (big[i] > limit) c++` | 4906 | 3009 | 1.6× |
+| Count 16 `u32` values over a limit: `if (big[i] > limit) c++` | 4906 | 2673 | 1.8× |
 
 Division still calls the library's divide routine, so that row barely moves.
 
-To reproduce, run `sh tests/run.sh bench_core bench_more`. For PVSnesLib's numbers, point `TCC=` and
+### `while` and `do` loops over global arrays
+
+One call, 64 passes (`tests/cases/bench_while.c`):
+
+| Function | PVSnesLib 4.5 | This fork | Speed-up |
+|---|---:|---:|---:|
+| Sum 64 words: `while (i < n) { t += w[i]; i++; }` | 9693 | 2524 | 3.8× |
+| Sum 64 words, counting down: `while (n--) t += w[n]` | 7632 | 2275 | 3.4× |
+| Sum 64 words: `while (i < n) t += w[i++]` | 9693 | 2524 | 3.8× |
+| Copy 64 words: `while (n--) dst[n] = w[n]` | 8364 | 1861 | 4.5× |
+| Clear 64 bytes: `do { by[i] = 0; } while (++i < n)` | 6424 | 3245 | 2.0× |
+| Move 64 actors: `while (n--) { acts[n].x += acts[n].dx; ... }` | 17836 | 3982 | 4.5× |
+| Find a word, 64 reads: `while (w[i] != want) i++` | 7734 | 1709 | 4.5× |
+
+To reproduce, run `sh tests/run.sh bench_core bench_more bench_while`. For PVSnesLib's numbers, point `TCC=` and
 `OPT=` at its `816-tcc` and `816-opt`.
 
 ## What changed
@@ -78,7 +92,8 @@ To reproduce, run `sh tests/run.sh bench_core bench_more`. For PVSnesLib's numbe
 
 ### Code generation
 
-- **Compares** branch on the flags, rather than building a 0 or 1 first.
+- **Compares** branch on the flags, rather than building a 0 or 1 first. 816-opt also compares
+  straight against memory, rather than copying the right-hand side through a register first.
 - **Multiplies by a constant** use shifts and adds when that's cheaper.
 - **Global arrays and struct fields** are read with `ldx` and `lda.l sym,x`, with any constant
   offset folded into the address.
@@ -93,7 +108,11 @@ To reproduce, run `sh tests/run.sh bench_core bench_more`. For PVSnesLib's numbe
   lives in Y. For a `for` loop that's the variable its increment steps. For `while` and `do` loops
   it's the local the loop uses most.
 - **A loop's index in X.** When the counter indexes global arrays of one element size, X holds
-  `counter × size` for the whole loop and steps with the counter.
+  `counter × size` for the whole loop, in `for`, `while` and `do` loops alike. X follows every
+  write to the counter, wherever it is: `++` and `--` step it, and any other write recomputes it
+  from Y if the size is a power of 2 up to 16 (at other sizes such a loop goes without X). For
+  `while` and `do` loops, a local that indexes a global array is chosen for Y over a busier one.
+  `w[i++]` as a whole index steps at once and reads `w - 2,x`.
 - **`p++` is delayed** to the next sequence point, for a pointer in direct-page slots. `*p++` then
   reads through `p`, and the step is one add.
 - **`-mhx422`** uses the HX-422 cart's hardware multiplier for multiplies.
@@ -110,6 +129,8 @@ To reproduce, run `sh tests/run.sh bench_core bench_more`. For PVSnesLib's numbe
   - long ones (over 160 tokens);
   - ones with struct arguments or results, `...`, or an old-style declaration;
   - one whose address is taken. It's also compiled as a normal function for that use.
+- **`-mcartram`** puts the globals in RAM in the cart's ROM area, a bank DB points at, so they're
+  reached DB-relative at FastROM speed. Described under [Using it](#globals-in-cart-ram).
 
 ### The optimiser
 
@@ -131,7 +152,16 @@ make opt        # tools/816-opt/816-opt (needs PCRE2: mingw-w64-x86_64-pcre2 on 
 
 Use `816-tcc` and `tools/816-opt/816-opt` in place of PVSnesLib's
 `devkitsnes/bin/816-tcc` and `devkitsnes/tools/816-opt`. Everything after them (constify,
-wla-65816, wlalink, PVSnesLib's `libtcc.obj`) stays the same.
+wla-65816, wlalink) stays the same.
+
+**Link `lib816/libtcc.asm` instead of PVSnesLib's `libtcc.obj`.** It's the fork's copy of the
+compiler's helper routines (multiply, divide, 32-bit operations), with one fix: the divide routine
+read the direct page through DB, which was right only while DB was `$7E`. Assemble it with your
+project's memory map, as `tests/run.sh` does:
+
+```
+wla-65816 -d -s -x -DHIROM -DFASTROM -I <your hdr.asm folder> -o libtcc.obj lib816/libtcc.asm
+```
 
 **Your start-up code must define the direct-page names the fork uses.** PVSnesLib's crt0 has only
 the first block. Add `tcc__a0`–`a3` and `tcc__l0`–`l3`, in this order, at the end of the register
@@ -164,7 +194,43 @@ with PVSnesLib's compiler. `tests/rt/crt0.asm` is a complete example.
   -H         HiROM (mode 21) memory map
   -F         FastROM
   -mhx422    multiplies on the HX-422 cart's hardware multiplier ($3C30)
+  -mcartram[=bank]  globals in RAM in the cart's ROM area, that bank ($C8 by default)
 ```
+
+### Globals in cart RAM
+
+On a cart with RAM in its ROM area (the HX-422's PSRAM, writable from `$C8`),
+`-mcartram[=bank]` moves every global there. Your start-up code points DB at that bank, and the
+compiler reaches the globals DB-relative (`lda.w`). FastROM-speed memory beats WRAM:
+
+| Where the variable is | Instruction | Master cycles (16-bit load) |
+|---|---|---:|
+| WRAM `$7E` (uninitialised, without `-mcartram`) | `lda.w` | 34 |
+| WRAM `$7F` (initialised, without `-mcartram`) | `lda.l` | 40 |
+| Cart RAM, DB pointing at it | `lda.w` | 30 |
+
+- **What goes where:**
+  - `.bss` goes into a section called `cartram.bss`, which your crt0 anchors in that bank. So does
+    the RAM copy of initialised data (`globram.data`).
+  - `__TCC816_CARTRAM__` is defined as the bank.
+  - A global the file defines, and doesn't make `const`, is reached `.w`. Externs and `const`
+    data stay long, because they may be in WRAM or ROM.
+- **Keeping a variable in WRAM:** `__attribute__((section(".wram")))` keeps it in bank `$7E`,
+  reached long. Use it for HDMA tables and anything else that must stay there. It takes no
+  initial value; crt0 clears WRAM.
+- **crt0's part:**
+  - anchor both sections in the bank, using slot 3 (any bank's `$0000`–`$FFFF`) so the memory map
+    stays the same as everything else's;
+  - point DB at the bank;
+  - clear the area, then copy `glob.data` in;
+  - in any interrupt handler that calls C, set DB the same way.
+
+  `tests/rt/crt0.asm` does all of it under `CARTRAM`.
+
+The test emulator counts CPU cycles, not master cycles, so the benchmark tables above don't show
+this gain. Built with `-mcartram`, they stay within about 3% of the numbers above, and the small
+differences come from dropping the long-address cycle on globals. The real gain is on the bus: the
+table above, 30 master cycles against 34 or 40 for each global access.
 
 ### Inline assembly
 
@@ -217,6 +283,7 @@ runs it, and reports PASS or what went wrong. See [tests/README.md](tests/README
 sh tests/run.sh                    # every case
 sh tests/run.sh xloop ptrwalk      # some
 TCCFLAGS=-mhx422 sh tests/run.sh   # with the multiplier option
+TCCFLAGS=-mcartram sh tests/run.sh # every case's globals in cart RAM ($C8)
 OPT=cat sh tests/run.sh            # without the optimiser: the compiler's own code
 ```
 
@@ -228,7 +295,8 @@ without spaces, because wla-65816 fails on spaced paths. The emulator passes the
 
 The compiler is TCC's: the GNU Lesser General Public License (see [COPYING](COPYING) and
 [RELICENSING](RELICENSING)). 816-opt is PVSnesLib's, under the zlib licence (the notice is in each
-source file). The fork's additions to it (`src/deadstore.c`), the emulator and the tests are public
+source file). `lib816/libtcc.asm` is PVSnesLib's, under the MIT licence (the notice is in the
+file). The fork's additions to 816-opt (`src/deadstore.c`), the emulator and the tests are public
 domain.
 
 ## Acknowledgements

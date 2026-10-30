@@ -39,7 +39,11 @@ a few lines of straight code. Lines 816-tcc marks `; volatile` are never dropped
 - **Rules for 816-tcc's Y/X loops and direct-page pointers:**
   - `iny`/`dey` and `cpy`, with the counter in Y.
   - Shifts done in A.
-  - `while (n--)` as `dey / cpy.w #$ffff`.
+  - `while (n--)` as `dey / cpy.w #$ffff`, with X stepping alongside.
+  - A compare's right side no longer parked in a register: `sty rA / lda M / sta rB / lda rA / cmp rB`
+    becomes `tya / cmp M`.
+  - A `.bss` access isn't shortened to `.w` when its offset is negative (`w + -2,x`): at the start of
+    a bank that would wrap.
   - `[tcc__rN]` read as `[tcc__lK]` when `rN` is a copy of a slot pointer.
 
 **Inline assembly is left alone.** 816-tcc puts every `asm` and `__asmraw__` block between

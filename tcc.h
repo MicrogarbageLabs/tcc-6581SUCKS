@@ -500,6 +500,9 @@ struct TCCState
     /* -mhx422: 16-bit multiplies on the HX-422 cart's hardware multiplier
        ($00:3C30, core rev 0.35+) instead of tcc__mul */
     int hx422_mul;
+    /* -mcartram[=bank]: globals in RAM in the cart's ROM area (the HX-422's
+       PSRAM, bank $C8 unless named), reached as DB-relative absolute */
+    int cartram;
 #ifdef CONFIG_TCC_BCHECK
     /* compile with built-in memory and bounds checker */
     int do_bounds_check;

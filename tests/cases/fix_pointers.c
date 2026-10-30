@@ -18,8 +18,13 @@ int main(void)
     CHECK((u32) tab[0], 0x410010ULL);
     CHECK((u32) tab[1], 0x003400ULL);
     CHECK((u32) pg == (u32) &g, 1);
+#ifdef __TCC816_CARTRAM__
+    CHECK((u32) &g >> 16, __TCC816_CARTRAM__);  /* -mcartram: .bss is in cart RAM */
+    CHECK((u32) arr >> 16, __TCC816_CARTRAM__);
+#else
     CHECK((u32) &g >> 16, 0x7E);        /* .bss is in $7E */
     CHECK((u32) arr >> 16, 0x7E);
+#endif
     lp = (u8 *) 0x7F1234UL;
     CHECK((u32) lp + 1, 0x7F1235ULL);
 

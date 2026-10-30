@@ -1,11 +1,13 @@
 # Compiler tests
 
 Each `cases/*.c` is a small program that computes things and checks them. `run.sh` builds it the
-way a game is built (816-tcc, 816-opt, constify, wla-65816, wlalink with PVSnesLib's `libtcc.obj`),
+way a game is built (816-tcc, 816-opt, constify, wla-65816, wlalink with the helper routines
+assembled from `../lib816/libtcc.asm`),
 runs the ROM on a 65816 emulator, and reports PASS or what went wrong.
 
 ```sh
 make test                      # every case
+TCCFLAGS=-mcartram sh tests/run.sh   # every case with its globals in cart RAM (crt0_cart.obj)
 sh tests/run.sh fix_logic      # one
 TCC=/path/to/other/816-tcc sh tests/run.sh    # another compiler
 ```

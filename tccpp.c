@@ -3115,6 +3115,9 @@ static void next(void)
     TokenString str;
     struct macro_level *ml;
 
+#ifdef TCC_TARGET_816
+    tok_count++;
+#endif
 redo:
     if (parse_flags & PARSE_FLAG_SPACES)
         next_nomacro_spc();

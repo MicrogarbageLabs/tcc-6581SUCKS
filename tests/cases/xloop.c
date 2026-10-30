@@ -2,8 +2,8 @@
    the whole loop, stepped with the counter): element sizes 1, 2, 4 and a
    struct's, reads and writes, counting down, continue and break, the
    index's address taken, the test indexing too, an inner while; and the
-   loops that must not get it (two sizes, the counter written in the body,
-   an index other than the counter, a for loop inside). With them 816-opt's
+   loops that must not get it (two sizes, an index other than the counter,
+   a for loop inside; xwhile.c has writes to the counter). With them 816-opt's
    byte load (lda M / and #$00ff) on signed, unsigned and volatile bytes,
    and the commutative swap (sta rN / lda M / adc rN -> adc M). */
 #include "test.h"

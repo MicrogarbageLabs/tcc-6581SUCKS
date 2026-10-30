@@ -43,7 +43,7 @@ void help(void)
         "- Updated by Kobenairb in 2022\n"
         "- Added support for Mode 21 (HiRom) Memory Mapping and FastRom by DigiDwrf in 2024\n"
         "- Fixes, faster code and tests in this fork, 2026 (Readme.md)\n\n"
-        "usage: 816-tcc [-v] [-c] [-H] [-F] [-mhx422] [-o outfile] [-Idir] [-Wwarn] [infile1 infile2...]\n"
+        "usage: 816-tcc [-v] [-c] [-H] [-F] [-mhx422] [-mcartram[=bank]] [-o outfile] [-Idir] [-Wwarn] [infile1 infile2...]\n"
         "\n"
         "General options:\n"
         "  -v          display current version, increase verbosity\n"
@@ -51,6 +51,8 @@ void help(void)
         "  -H          hiRom (Mode 21) Memory Map compilation\n"
         "  -F          FastRom compilation\n"
         "  -mhx422     multiplies on the HX-422 cart's hardware multiplier ($3C30)\n"
+        "  -mcartram[=bank]  globals in RAM in the cart's ROM area, that bank ($C8\n"
+        "              by default), reached DB-relative; crt0 must point DB there\n"
         "  -o outfile  set output filename\n"
         "  -Wwarning   set or reset (with 'no-' prefix) 'warning' (see man page)\n"
         "  -w          disable all warnings\n"
@@ -422,8 +424,25 @@ int parse_args(TCCState *s, int argc, char **argv)
                 if (!strcmp(optarg, "hx422") || !strcmp(optarg, "_hx422")) {
                     s->hx422_mul = 1;
                     tcc_define_symbol(s, "__HX422_MUL__", "1");
+                } else if (!strncmp(optarg, "cartram", 7) && (!optarg[7] || optarg[7] == '=')) {
+                    /* -mcartram[=bank]: globals in cart RAM, that bank (hex,
+                       $C8 by default; $ or 0x allowed), which crt0 points DB
+                       at; __TCC816_CARTRAM__ is the bank */
+                    const char *b = optarg[7] ? optarg + 8 : "C8";
+                    char num[16];
+                    unsigned long v;
+                    if (*b == '$')
+                        b++;
+                    else if (b[0] == '0' && (b[1] == 'x' || b[1] == 'X'))
+                        b += 2;
+                    v = strtoul(b, NULL, 16);
+                    if (v < 0x40 || v > 0xFF || v == 0x7E || v == 0x7F)
+                        error("-mcartram: bank $%s is not a cart bank", b);
+                    s->cartram = (int) v;
+                    snprintf(num, sizeof num, "0x%02lX", v);
+                    tcc_define_symbol(s, "__TCC816_CARTRAM__", num);
                 } else
-                    error("unknown option '-m%s' (816-tcc knows -mhx422)", optarg);
+                    error("unknown option '-m%s' (816-tcc knows -mhx422 and -mcartram[=bank])", optarg);
                 break;
             case TCC_OPTION_F:
                 s->fastrom_comp = 1;
