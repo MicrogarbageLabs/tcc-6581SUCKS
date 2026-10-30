@@ -5863,6 +5863,17 @@ static void decl_initializer_alloc(
                 sec = bss_section;
             }
         }
+#ifdef TCC_TARGET_816
+        /* a big const table: a section of its own, which the linker can put
+           in any bank. .rodata stays in bank 0's upper half with the vectors
+           and shares its 32 KB, so a 64 KB table could never fit there */
+        if (sec == rodata_section && size >= 0x1000 && !dry_run && tcc_state->hirom_comp) {
+            static int big_tables;
+            char big_name[32];
+            snprintf(big_name, sizeof big_name, ".rodata_big%d", big_tables++);
+            sec = new_section(tcc_state, big_name, SHT_PROGBITS, SHF_ALLOC);
+        }
+#endif
         if (sec) {
             data_offset = sec->data_offset;
             data_offset = (data_offset + align - 1) & -align;

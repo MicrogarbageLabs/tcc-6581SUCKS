@@ -113,6 +113,9 @@ To reproduce, run `sh tests/run.sh bench_core bench_more bench_while`. For PVSne
   from Y if the size is a power of 2 up to 16 (at other sizes such a loop goes without X). For
   `while` and `do` loops, a local that indexes a global array is chosen for Y over a busier one.
   `w[i++]` as a whole index steps at once and reads `w - 2,x`.
+- **Big `const` tables** (4 KB or more) get a section of their own, so a HiROM link can put them in
+  any bank, a whole 64 KB table included. Stock `.rodata` stays in bank 0's upper half, 32 KB at most
+  shared with the vectors. Data lines break every 32 bytes, because 816-opt splits very long ones.
 - **`p++` is delayed** to the next sequence point, for a pointer in direct-page slots. `*p++` then
   reads through `p`, and the step is one add.
 - **`-mhx422`** uses the HX-422 cart's hardware multiplier for multiplies.

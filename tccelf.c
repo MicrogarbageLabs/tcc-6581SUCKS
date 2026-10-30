@@ -1941,7 +1941,12 @@ static void tcc_output_binary(TCCState *s1, FILE *f, const int *section_order)
                                 ".SECTION \"%s%s\" APPENDTO \"glob.data\"\n",
                                 unique_token,
                                 s->name);
-                    else {
+                    else if (!strncmp(s->name, ".rodata_big", 11)) {
+                        /* any bank, at the ROM's own base: at $00 a bank
+                           past the first has only its upper half */
+                        fprintf(f, ".BASE $%s\n", s1->fastrom_comp ? "C0" : "40");
+                        fprintf(f, ".SECTION \"%s%s\" SUPERFREE\n", unique_token, s->name);
+                    } else {
                         if (s1->hirom_comp)
                             fprintf(f, ".SECTION \"%s\" SEMIFREE ORG $8000\n",
                                     s->name); // 09042021
@@ -2052,7 +2057,9 @@ static void tcc_output_binary(TCCState *s1, FILE *f, const int *section_order)
                         continue;
                     }
 
-                    if (!deebeed) {
+                    /* a new line every 32 bytes: 816-opt splits a line past
+                       its limit, leaving a fragment with no .db */
+                    if (!deebeed || (j & 31) == 0) {
                         if (k == 1)
                             fprintf(f, "\n.db ");
                         deebeed = 1;
