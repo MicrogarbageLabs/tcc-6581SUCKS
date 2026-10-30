@@ -228,7 +228,7 @@ compiler reaches the globals DB-relative (`lda.w`). FastROM-speed memory beats W
   `tests/rt/crt0.asm` does all of it under `CARTRAM`.
 
 The test emulator counts CPU cycles, not master cycles, so the benchmark tables above don't show
-this gain. Built with `-mcartram`, they stay within about 3% of the numbers above, and the small
+this gain. Built with `-mcartram`, they stay within 4% of the numbers above, and the small
 differences come from dropping the long-address cycle on globals. The real gain is on the bus: the
 table above, 30 master cycles against 34 or 40 for each global access.
 
