@@ -308,4 +308,3 @@ domain.
 - Ulrich Hecht, for the 65816 back end.
 - [Alekmaul](https://github.com/alekmaul) and [Kobenairb](https://github.com/kobenairb), for
   816-tcc, 816-opt and PVSnesLib.
-- This fork: John McAlarney.
