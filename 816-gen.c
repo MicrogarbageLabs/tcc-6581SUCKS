@@ -1007,6 +1007,10 @@ void yl_loop_end(void)
                     && (!yl[k].cwrites || (yl[k].scale <= 16 && !(yl[k].scale & (yl[k].scale - 1))))
                     && !text_writes_x((char *) cur_text_section->data + yl[k].start,
                                       (char *) cur_text_section->data + yl[k].end);
+        /* an index the dry run gave to X and X can't take is a multiply in the
+           real pass, which the text above doesn't show and which uses Y */
+        if (yl[k].scale & (yl[k].scale - 1) && !yl[k].xok)
+            yl[k].ok = 0;
         if (yl_norder < YL_MAX)
             yl_order[yl_norder++] = k;
         return;
@@ -2777,7 +2781,9 @@ void gen_opi(int op)
     case TOK_SHR:
     case TOK_SHL:
         timesshift = 1;
-#define UNROLL_SHIFT_MAX 4
+/* a constant shift never touches Y: the dry run can't see one for an index
+   it gave to X, and if X falls through, Y may be the loop's counter */
+#define UNROLL_SHIFT_MAX 15
 #define SHIFT_IN_PLACE_MAX 2
         if (isconst) {
             pr("; %s tcc__r%d, #%d\n",
