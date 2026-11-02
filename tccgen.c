@@ -2091,6 +2091,14 @@ static void gen_cast(CType *type)
                 }
 #endif
 #ifdef TCC_TARGET_816
+            } else if ((dbt & VT_BTYPE) == VT_PTR && (sbt & VT_BTYPE) == VT_LLONG
+                       && !(vtop->r & VT_LVAL) && (vtop->r & VT_VALMASK) < VT_CONST
+                       && !nocode_wanted) {
+                /* a computed u32 is a pair of registers, a pointer one register
+                   and its high half: bring the high word over */
+                gv(RC_INT);
+                gen_pair_to_ptr(vtop->r & VT_VALMASK, vtop->r2 & VT_VALMASK);
+                vtop->r2 = VT_CONST;
             } else if ((dbt & VT_BTYPE) == VT_BOOL) {
                 if (c)
                     vtop->c.ui = vtop->c.ui ? 1 : 0;

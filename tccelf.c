@@ -793,7 +793,8 @@ static void relocate_section(TCCState *s1, Section *s)
 #endif
 #ifdef TCC_TARGET_816
     if (!relocptrs) {
-        relocptrs = calloc(0x100000, sizeof(char *));
+        relocptrs = calloc(RELOC_SLOTS, sizeof(char *));
+        relocaddrs = calloc(RELOC_SLOTS, sizeof(unsigned char *));
     }
 #endif
 
@@ -948,9 +949,13 @@ static void relocate_section(TCCState *s1, Section *s)
 #elif defined(TCC_TARGET_816)
         case R_DATA_32:
             /* no need to change the value at ptr, we only need the offset, and that's already there */
-            if (relocptrs[((unsigned long) ptr) & 0xfffff])
-                error("relocptrs collision");
-            relocptrs[((unsigned long) ptr) & 0xfffff] = symtab_section->link->data + sym->st_name;
+            {
+                unsigned int slot = reloc_slot(ptr);
+                if (relocptrs[slot])
+                    error("relocptrs collision");
+                relocaddrs[slot] = ptr;
+                relocptrs[slot] = symtab_section->link->data + sym->st_name;
+            }
             break;
         default:
             fprintf(stderr,
@@ -2029,9 +2034,9 @@ static void tcc_output_binary(TCCState *s1, FILE *f, const int *section_order)
                         if (k == 0) { /* .ramsection, just count bytes */
                             bytecount++;
                         } else { /* (ROM) .section, need to output data */
-                            if (relocptrs && relocptrs[((unsigned long) &s->data[j]) & 0xfffff]) {
+                            char *ptrname = reloc_name(&s->data[j]);
+                            if (ptrname) {
                                 /* relocated -> print a symbolic pointer */
-                                char *ptrname = relocptrs[((unsigned long) &s->data[j]) & 0xfffff];
                                 fprintf(f, ".dw %s + %d, :%s", ptrname, ptr, ptrname);
                                 j += 3; /* we have handled 3 more bytes than expected */
                                 deebeed = 0;
@@ -2045,13 +2050,13 @@ static void tcc_output_binary(TCCState *s1, FILE *f, const int *section_order)
                     }
 
                     /* no symbol here, just print the data */
-                    if (k == 1 && relocptrs && relocptrs[((unsigned long) &s->data[j]) & 0xfffff]) {
+                    if (k == 1 && reloc_name(&s->data[j])) {
                         /* unlabeled data may have been relocated, too */
                         fprintf(f,
                                 "\n.dw %s + %d\n.dw :%s",
-                                relocptrs[((unsigned long) &s->data[j]) & 0xfffff],
+                                reloc_name(&s->data[j]),
                                 *(unsigned int *) (&s->data[j]),
-                                relocptrs[((unsigned long) &s->data[j]) & 0xfffff]);
+                                reloc_name(&s->data[j]));
                         j += 3;
                         deebeed = 0;
                         continue;

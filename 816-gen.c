@@ -119,7 +119,24 @@ char unique_token[] = "{WLA_FILENAME}";
 char current_fn[MAXLEN] = "";
 
 // Variable relocate a given section
+/* what each relocated word of data points at, hashed on its full host address:
+   on the low bits alone, a word of a big table could pass for a pointer */
+#define RELOC_SLOTS 0x100000
 char **relocptrs = NULL;
+static unsigned char **relocaddrs = NULL;
+
+static unsigned int reloc_slot(unsigned char *ptr)
+{
+    unsigned int i = (unsigned int) (unsigned long long) ptr & (RELOC_SLOTS - 1);
+    while (relocaddrs[i] && relocaddrs[i] != ptr)
+        i = (i + 1) & (RELOC_SLOTS - 1);
+    return i;
+}
+
+static char *reloc_name(unsigned char *ptr)
+{
+    return relocptrs ? relocptrs[reloc_slot(ptr)] : NULL;
+}
 
 char *label_workaround = NULL;
 
@@ -3004,6 +3021,12 @@ void convert_type_helper(int it, const char *unsigned_fn, const char *signed_fn)
  * variable `vtop` to indicate that the result of the conversion is in
  * the `TREG_F0` register.
  */
+/* the u32 in registers lo, hi becomes the pointer in lo and its high half */
+void gen_pair_to_ptr(int lo, int hi)
+{
+    pr("lda.b tcc__r%d\nsta.b tcc__r%dh\n", hi, lo);
+}
+
 void gen_cvt_itof(int t)
 {
     int r, r2, it;
